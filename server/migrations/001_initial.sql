@@ -2,6 +2,7 @@ CREATE EXTENSION IF NOT EXISTS pgcrypto;
 
 CREATE TABLE IF NOT EXISTS schema_migrations (
   version text PRIMARY KEY,
+  checksum text NOT NULL,
   applied_at timestamptz NOT NULL DEFAULT now()
 );
 
@@ -27,18 +28,23 @@ CREATE TABLE IF NOT EXISTS teams (
   name text NOT NULL,
   slug text NOT NULL,
   created_at timestamptz NOT NULL DEFAULT now(),
-  UNIQUE (organization_id, slug)
+  UNIQUE (organization_id, slug),
+  UNIQUE (id, organization_id)
 );
 
 CREATE TABLE IF NOT EXISTS memberships (
   id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
   organization_id uuid NOT NULL REFERENCES organizations(id) ON DELETE CASCADE,
-  team_id uuid REFERENCES teams(id) ON DELETE CASCADE,
+  team_id uuid,
   user_id uuid NOT NULL REFERENCES users(id) ON DELETE CASCADE,
   role text NOT NULL CHECK (role IN ('owner', 'admin', 'developer', 'reviewer', 'viewer')),
   created_at timestamptz NOT NULL DEFAULT now(),
-  UNIQUE NULLS NOT DISTINCT (organization_id, user_id, team_id)
+  UNIQUE NULLS NOT DISTINCT (organization_id, user_id, team_id),
+  FOREIGN KEY (team_id, organization_id) REFERENCES teams(id, organization_id) ON DELETE CASCADE
 );
+
+CREATE UNIQUE INDEX IF NOT EXISTS memberships_one_organization_per_user
+  ON memberships (user_id) WHERE team_id IS NULL;
 
 CREATE TABLE IF NOT EXISTS sessions (
   id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
@@ -49,10 +55,13 @@ CREATE TABLE IF NOT EXISTS sessions (
   last_seen_at timestamptz NOT NULL DEFAULT now()
 );
 
+CREATE INDEX IF NOT EXISTS sessions_user_id ON sessions (user_id);
+CREATE INDEX IF NOT EXISTS sessions_expires_at ON sessions (expires_at);
+
 CREATE TABLE IF NOT EXISTS projects (
   id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
   organization_id uuid NOT NULL REFERENCES organizations(id) ON DELETE CASCADE,
-  team_id uuid NOT NULL REFERENCES teams(id) ON DELETE RESTRICT,
+  team_id uuid NOT NULL,
   owner_id uuid NOT NULL REFERENCES users(id) ON DELETE RESTRICT,
   name text NOT NULL,
   slug text NOT NULL,
@@ -60,7 +69,10 @@ CREATE TABLE IF NOT EXISTS projects (
   environment text NOT NULL DEFAULT 'development' CHECK (environment IN ('development', 'staging', 'production')),
   created_at timestamptz NOT NULL DEFAULT now(),
   updated_at timestamptz NOT NULL DEFAULT now(),
-  UNIQUE (organization_id, slug)
+  UNIQUE (organization_id, slug),
+  UNIQUE (id, organization_id),
+  UNIQUE (id, organization_id, team_id),
+  FOREIGN KEY (team_id, organization_id) REFERENCES teams(id, organization_id) ON DELETE RESTRICT
 );
 
 CREATE TABLE IF NOT EXISTS ai_providers (
@@ -70,12 +82,13 @@ CREATE TABLE IF NOT EXISTS ai_providers (
   base_url text NOT NULL,
   encrypted_api_key text,
   default_model text NOT NULL,
-  allowed_models jsonb NOT NULL DEFAULT '[]'::jsonb,
+  allowed_models jsonb NOT NULL DEFAULT '[]'::jsonb CHECK (jsonb_typeof(allowed_models) = 'array'),
   input_cost_per_million numeric(12,6) NOT NULL DEFAULT 0,
   output_cost_per_million numeric(12,6) NOT NULL DEFAULT 0,
   enabled boolean NOT NULL DEFAULT true,
   created_at timestamptz NOT NULL DEFAULT now(),
-  UNIQUE (organization_id, name)
+  UNIQUE (organization_id, name),
+  UNIQUE (id, organization_id)
 );
 
 CREATE TABLE IF NOT EXISTS ai_policies (
@@ -83,17 +96,18 @@ CREATE TABLE IF NOT EXISTS ai_policies (
   organization_id uuid NOT NULL REFERENCES organizations(id) ON DELETE CASCADE,
   scope_type text NOT NULL CHECK (scope_type IN ('global', 'team', 'user', 'project')),
   scope_id uuid NOT NULL,
-  default_provider_id uuid NOT NULL REFERENCES ai_providers(id) ON DELETE RESTRICT,
+  default_provider_id uuid NOT NULL,
   default_model text NOT NULL,
-  allowed_provider_ids jsonb NOT NULL DEFAULT '[]'::jsonb,
-  allowed_models jsonb NOT NULL DEFAULT '[]'::jsonb,
+  allowed_provider_ids jsonb NOT NULL DEFAULT '[]'::jsonb CHECK (jsonb_typeof(allowed_provider_ids) = 'array'),
+  allowed_models jsonb NOT NULL DEFAULT '[]'::jsonb CHECK (jsonb_typeof(allowed_models) = 'array'),
   monthly_token_limit bigint NOT NULL CHECK (monthly_token_limit > 0),
   monthly_cost_limit_usd numeric(12,2) NOT NULL CHECK (monthly_cost_limit_usd >= 0),
   allow_user_override boolean NOT NULL DEFAULT false,
-  require_approval_for jsonb NOT NULL DEFAULT '[]'::jsonb,
+  require_approval_for jsonb NOT NULL DEFAULT '[]'::jsonb CHECK (jsonb_typeof(require_approval_for) = 'array'),
   created_at timestamptz NOT NULL DEFAULT now(),
   updated_at timestamptz NOT NULL DEFAULT now(),
-  UNIQUE (organization_id, scope_type, scope_id)
+  UNIQUE (organization_id, scope_type, scope_id),
+  FOREIGN KEY (default_provider_id, organization_id) REFERENCES ai_providers(id, organization_id) ON DELETE RESTRICT
 );
 
 CREATE TABLE IF NOT EXISTS prompt_hooks (
@@ -113,21 +127,27 @@ CREATE TABLE IF NOT EXISTS prompt_hooks (
 CREATE TABLE IF NOT EXISTS agent_runs (
   id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
   organization_id uuid NOT NULL REFERENCES organizations(id) ON DELETE CASCADE,
-  team_id uuid NOT NULL REFERENCES teams(id) ON DELETE RESTRICT,
-  project_id uuid NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+  team_id uuid NOT NULL,
+  project_id uuid NOT NULL,
   user_id uuid NOT NULL REFERENCES users(id) ON DELETE RESTRICT,
   phase text NOT NULL,
   prompt text NOT NULL CHECK (length(prompt) <= 50000),
-  status text NOT NULL DEFAULT 'queued' CHECK (status IN ('queued', 'planning', 'editing', 'testing', 'ready', 'failed')),
-  provider_id uuid REFERENCES ai_providers(id) ON DELETE SET NULL,
+  status text NOT NULL DEFAULT 'queued' CHECK (status IN ('waiting_approval', 'queued', 'planning', 'editing', 'testing', 'ready', 'failed')),
+  provider_id uuid,
   model text,
   input_tokens integer NOT NULL DEFAULT 0,
   output_tokens integer NOT NULL DEFAULT 0,
   total_tokens integer NOT NULL DEFAULT 0,
   estimated_cost_usd numeric(12,6) NOT NULL DEFAULT 0,
   error_code text,
+  approved_by uuid REFERENCES users(id) ON DELETE RESTRICT,
+  approved_at timestamptz,
+  commit_sha text,
   created_at timestamptz NOT NULL DEFAULT now(),
-  finished_at timestamptz
+  finished_at timestamptz,
+  FOREIGN KEY (team_id, organization_id) REFERENCES teams(id, organization_id) ON DELETE RESTRICT,
+  FOREIGN KEY (project_id, organization_id, team_id) REFERENCES projects(id, organization_id, team_id) ON DELETE CASCADE,
+  FOREIGN KEY (provider_id, organization_id) REFERENCES ai_providers(id, organization_id) ON DELETE SET NULL (provider_id)
 );
 
 CREATE TABLE IF NOT EXISTS agent_run_events (
@@ -153,36 +173,43 @@ CREATE TABLE IF NOT EXISTS agent_run_files (
 CREATE TABLE IF NOT EXISTS token_usage_events (
   id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
   organization_id uuid NOT NULL REFERENCES organizations(id) ON DELETE CASCADE,
-  team_id uuid NOT NULL REFERENCES teams(id) ON DELETE CASCADE,
+  team_id uuid NOT NULL,
   user_id uuid NOT NULL REFERENCES users(id) ON DELETE CASCADE,
-  project_id uuid NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+  project_id uuid NOT NULL,
   run_id uuid REFERENCES agent_runs(id) ON DELETE SET NULL,
-  provider_id uuid REFERENCES ai_providers(id) ON DELETE SET NULL,
+  provider_id uuid,
   model text NOT NULL,
   phase text NOT NULL,
-  input_tokens integer NOT NULL,
-  output_tokens integer NOT NULL,
-  total_tokens integer NOT NULL,
-  estimated_cost_usd numeric(12,6) NOT NULL,
-  completed_at timestamptz NOT NULL DEFAULT now()
+  input_tokens integer NOT NULL CHECK (input_tokens >= 0),
+  output_tokens integer NOT NULL CHECK (output_tokens >= 0),
+  total_tokens integer NOT NULL CHECK (total_tokens >= 0),
+  estimated_cost_usd numeric(12,6) NOT NULL CHECK (estimated_cost_usd >= 0),
+  completed_at timestamptz NOT NULL DEFAULT now(),
+  FOREIGN KEY (team_id, organization_id) REFERENCES teams(id, organization_id) ON DELETE CASCADE,
+  FOREIGN KEY (project_id, organization_id, team_id) REFERENCES projects(id, organization_id, team_id) ON DELETE CASCADE,
+  FOREIGN KEY (provider_id, organization_id) REFERENCES ai_providers(id, organization_id) ON DELETE SET NULL (provider_id)
 );
 
 CREATE INDEX IF NOT EXISTS usage_org_time ON token_usage_events (organization_id, completed_at DESC);
 CREATE INDEX IF NOT EXISTS usage_team_time ON token_usage_events (team_id, completed_at DESC);
 CREATE INDEX IF NOT EXISTS usage_user_time ON token_usage_events (user_id, completed_at DESC);
-
+CREATE INDEX IF NOT EXISTS runs_project_time ON agent_runs (project_id, created_at DESC);
+CREATE INDEX IF NOT EXISTS run_events_run_sequence ON agent_run_events (run_id, sequence);
 CREATE TABLE IF NOT EXISTS deployments (
   id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
   organization_id uuid NOT NULL REFERENCES organizations(id) ON DELETE CASCADE,
-  project_id uuid NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+  project_id uuid NOT NULL,
   requested_by uuid NOT NULL REFERENCES users(id) ON DELETE RESTRICT,
   approved_by uuid REFERENCES users(id) ON DELETE RESTRICT,
   environment text NOT NULL CHECK (environment IN ('staging', 'production')),
   status text NOT NULL DEFAULT 'preflight' CHECK (status IN ('preflight', 'waiting_approval', 'approved', 'deployed', 'failed', 'rolled_back')),
   commit_sha text,
   created_at timestamptz NOT NULL DEFAULT now(),
-  updated_at timestamptz NOT NULL DEFAULT now()
+  updated_at timestamptz NOT NULL DEFAULT now(),
+  FOREIGN KEY (project_id, organization_id) REFERENCES projects(id, organization_id) ON DELETE CASCADE
 );
+
+CREATE INDEX IF NOT EXISTS deployments_project_time ON deployments (project_id, created_at DESC);
 
 CREATE TABLE IF NOT EXISTS deployment_events (
   id bigserial PRIMARY KEY,

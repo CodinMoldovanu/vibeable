@@ -11,3 +11,5 @@ All notable changes to Vibeable will be documented here. The format follows Keep
 - OpenAI-compatible providers, scoped AI policies, prompt hooks, and budget enforcement.
 - Structured coding runs, SSE event streaming, workspace previews, and usage metrics.
 - Deployment approval records, Docker Compose packaging, CI, tests, and security documentation.
+- Dual PolyForm licensing for perpetual internal company use and noncommercial community use.
+- Git-backed run branches and commits, independent run approvals, selectable metric scopes, and PostgreSQL integration tests.

@@ -9,8 +9,9 @@ const schema = z.object({
   DATABASE_SSL: z.enum(["disable", "require", "verify-full"]).default("disable"),
   PUBLIC_URL: z.string().url().default("http://127.0.0.1:8787"),
   DATA_DIR: z.string().default(".vibeable"),
-  MASTER_KEY: z.string().default("development-only-master-key-change-me"),
+  MASTER_KEY: z.string().min(32).default("development-only-master-key-change-me"),
   SESSION_TTL_DAYS: z.coerce.number().int().min(1).max(90).default(14),
+  REQUIRE_SEPARATE_APPROVER: z.enum(["true", "false"]).default("true"),
   EXECUTION_MODE: z.enum(["disabled", "local", "docker"]).default("disabled"),
   ALLOW_PRIVATE_AI_ENDPOINTS: z.enum(["true", "false"]).default("false"),
   COOKIE_SECURE: z.enum(["true", "false"]).optional(),
@@ -28,6 +29,7 @@ export const config = {
   ...values,
   DATA_DIR: resolve(values.DATA_DIR),
   allowPrivateAiEndpoints: values.ALLOW_PRIVATE_AI_ENDPOINTS === "true",
+  requireSeparateApprover: values.REQUIRE_SEPARATE_APPROVER === "true",
   cookieSecure: values.COOKIE_SECURE ? values.COOKIE_SECURE === "true" : values.NODE_ENV === "production",
   trustProxy: values.TRUST_PROXY === "true"
 };

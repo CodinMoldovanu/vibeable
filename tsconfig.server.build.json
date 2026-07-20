@@ -1,0 +1,7 @@
+{
+  "extends": "./tsconfig.server.json",
+  "compilerOptions": {
+    "sourceMap": false
+  },
+  "exclude": ["**/*.test.ts", "**/*.integration.test.ts"]
+}

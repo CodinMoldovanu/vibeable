@@ -2,9 +2,11 @@
 
 Thank you for helping build Vibeable.
 
+Vibeable is source-available, not OSI open source. By submitting a contribution, you agree to license that contribution under both licenses offered in [LICENSE](LICENSE), and you certify that you have the right to do so. Do not submit code whose license is incompatible with both project licenses.
+
 ## Setup
 
-Use Node.js 22+, pnpm 11, and PostgreSQL 15+. Copy `.env.example`, run `pnpm install`, `pnpm db:migrate`, and `pnpm dev`.
+Use Node.js 22+, pnpm 11, Git 2.28+, and PostgreSQL 15+. Copy `.env.example`, run `pnpm install`, `pnpm db:migrate`, and `pnpm dev`.
 
 Before submitting a change, run:
 

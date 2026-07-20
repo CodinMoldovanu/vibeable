@@ -3,7 +3,7 @@ import { generateEdits } from "./ai.js";
 import { query, transaction } from "./db.js";
 import { publishRunEvent } from "./events.js";
 import { assertBudget, resolvePolicy } from "./policy.js";
-import { applyEdits, ensureWorkspace, verifyWorkspace, workspaceContext } from "./workspace.js";
+import { abortRunBranch, applyEdits, commitRun, ensureWorkspace, finalizeRunBranch, prepareRunBranch, verifyWorkspace, workspaceContext } from "./workspace.js";
 
 interface RunRow {
   id: string;
@@ -21,6 +21,7 @@ export function enqueueRun(runId: string) {
 }
 
 export async function executeRun(runId: string) {
+  let runDirectory: string | undefined;
   try {
     const runResult = await query<RunRow>(
       `SELECT r.id, r.organization_id AS "organizationId", r.team_id AS "teamId", r.project_id AS "projectId",
@@ -32,7 +33,7 @@ export async function executeRun(runId: string) {
     if (!run) return;
 
     await setStatus(run.id, "planning");
-    await addEvent(run.id, "policy", "Resolving effective organization, team, user, and project policy");
+    await recordRunEvent(run.id, "policy", "Resolving effective organization, team, user, and project policy");
     const policy = await resolvePolicy({
       organizationId: run.organizationId,
       teamId: run.teamId,
@@ -49,14 +50,16 @@ export async function executeRun(runId: string) {
       providerHasCost: policy.inputCostPerMillion > 0 || policy.outputCostPerMillion > 0
     });
     await query("UPDATE agent_runs SET provider_id = $2, model = $3 WHERE id = $1", [run.id, policy.provider.id, policy.model]);
-    await addEvent(run.id, "provider", `Using ${policy.provider.name} / ${policy.model}`, {
+    await recordRunEvent(run.id, "provider", `Using ${policy.provider.name} / ${policy.model}`, {
       hookCount: policy.hooks.length
     });
 
     const directory = await ensureWorkspace(run.projectId, run.projectName);
+    runDirectory = directory;
+    await prepareRunBranch(directory, run.id);
     const context = await workspaceContext(directory);
     await setStatus(run.id, "editing");
-    await addEvent(run.id, "agent", "Requesting a structured edit set from the AI gateway");
+    await recordRunEvent(run.id, "agent", "Requesting a structured edit set from the AI gateway");
     const completion = await generateEdits({
       baseUrl: policy.provider.baseUrl,
       encryptedApiKey: policy.encryptedApiKey,
@@ -66,22 +69,29 @@ export async function executeRun(runId: string) {
       workspaceContext: context
     });
     const changedFiles = await applyEdits(directory, completion.result.files);
-    await addEvent(run.id, "files", `Applied ${changedFiles.length} generated file change(s)`, {
+    await recordRunEvent(run.id, "files", `Applied ${changedFiles.length} generated file change(s)`, {
       files: changedFiles.map((file) => file.path)
     });
 
     await setStatus(run.id, "testing");
-    await addEvent(run.id, "verification", "Running workspace verification");
+    await recordRunEvent(run.id, "verification", "Running workspace verification");
     const verification = await verifyWorkspace(directory);
     const estimatedCost =
       completion.usage.inputTokens / 1_000_000 * policy.inputCostPerMillion +
       completion.usage.outputTokens / 1_000_000 * policy.outputCostPerMillion;
+    const commitSha = await commitRun(directory, {
+      runId: run.id,
+      userId: run.userId,
+      providerId: policy.provider.id,
+      model: policy.model,
+      totalTokens: completion.usage.totalTokens
+    });
 
     await transaction(async (client) => {
       await client.query(
-        `UPDATE agent_runs SET status = 'ready', input_tokens = $2, output_tokens = $3, total_tokens = $4,
-           estimated_cost_usd = $5, finished_at = now() WHERE id = $1`,
-        [run.id, completion.usage.inputTokens, completion.usage.outputTokens, completion.usage.totalTokens, estimatedCost]
+        `UPDATE agent_runs SET input_tokens = $2, output_tokens = $3, total_tokens = $4,
+           estimated_cost_usd = $5, commit_sha = $6 WHERE id = $1`,
+        [run.id, completion.usage.inputTokens, completion.usage.outputTokens, completion.usage.totalTokens, estimatedCost, commitSha]
       );
       for (const file of changedFiles) {
         await client.query(
@@ -98,19 +108,25 @@ export async function executeRun(runId: string) {
         [run.organizationId, run.teamId, run.userId, run.projectId, run.id, policy.provider.id, policy.model,
           run.phase, completion.usage.inputTokens, completion.usage.outputTokens, completion.usage.totalTokens, estimatedCost]
       );
+    });
+    await finalizeRunBranch(directory, run.id);
+    await transaction(async (client) => {
+      await client.query("UPDATE agent_runs SET status = 'ready', finished_at = now() WHERE id = $1", [run.id]);
       await client.query("UPDATE projects SET status = 'ready', updated_at = now() WHERE id = $1", [run.projectId]);
     });
-    await addEvent(run.id, "complete", "Run completed and preview updated", {
+    await recordRunEvent(run.id, "complete", "Run completed and preview updated", {
       summary: completion.result.summary,
+      commitSha,
       verification: verification.output.slice(0, 4000)
     });
   } catch (error) {
+    if (runDirectory) await abortRunBranch(runDirectory, runId);
     const message = error instanceof Error ? error.message : "Unknown orchestration failure";
     await query(
       "UPDATE agent_runs SET status = 'failed', error_code = $2, finished_at = now() WHERE id = $1",
       [runId, classifyError(error)]
     ).catch(() => undefined);
-    await addEvent(runId, "error", redact(message)).catch(() => undefined);
+    await recordRunEvent(runId, "error", redact(message)).catch(() => undefined);
   }
 }
 
@@ -118,7 +134,7 @@ async function setStatus(runId: string, status: string) {
   await query("UPDATE agent_runs SET status = $2 WHERE id = $1", [runId, status]);
 }
 
-async function addEvent(runId: string, type: string, message: string, metadata: Record<string, unknown> = {}) {
+export async function recordRunEvent(runId: string, type: string, message: string, metadata: Record<string, unknown> = {}) {
   const result = await query<{
     id: string; runId: string; sequence: number; type: string; message: string;
     metadata: Record<string, unknown>; createdAt: string;

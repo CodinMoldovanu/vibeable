@@ -17,11 +17,11 @@ Vibeable 0.1 is a community preview for trusted internal teams. It is not yet sa
 - Serve previews from a separate origin with short-lived capability tokens.
 - Add outbound DNS/IP pinning and an egress proxy for provider requests.
 - Add OIDC/SAML, MFA delegation, password reset, email invitations, and session management UI.
-- Add repository import/export, Git commits, branches, diffs, conflict handling, and remote push.
+- Add repository import/export, remote push, side-by-side diffs, conflict handling, and explicit accept/reject review. Local branches and attributed commits are implemented.
 - Add an actual deployment adapter and rollback implementation. Current deployment endpoints record approvals only.
 - Reserve budget before concurrent calls and reconcile streamed/provider usage.
 - Add secret rotation/versioning and integrate a production secret manager.
-- Add PostgreSQL integration tests, browser end-to-end tests, backup/restore drills, SLOs, and load tests.
+- Add broader browser end-to-end coverage, backup/restore drills, SLOs, and load tests. Disposable PostgreSQL API integration tests run in the standard test suite.
 - Complete an independent security review.
 
 ## Release checklist

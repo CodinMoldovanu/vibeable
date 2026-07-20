@@ -13,4 +13,17 @@ describe("RBAC", () => {
     expect(can("developer", "deployment:approve")).toBe(false);
     expect(can("reviewer", "deployment:approve")).toBe(true);
   });
+
+  it("separates agent execution from approval", () => {
+    expect(can("developer", "agent:run")).toBe(true);
+    expect(can("developer", "agent:approve_changes")).toBe(false);
+    expect(can("reviewer", "agent:run")).toBe(false);
+    expect(can("reviewer", "agent:approve_changes")).toBe(true);
+  });
+
+  it("allows project metrics without exposing global metrics", () => {
+    expect(can("developer", "metrics:read_project")).toBe(true);
+    expect(can("developer", "metrics:read_team")).toBe(false);
+    expect(can("reviewer", "metrics:read_project")).toBe(true);
+  });
 });

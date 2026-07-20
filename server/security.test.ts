@@ -16,5 +16,8 @@ describe("security helpers", () => {
   it("rejects insecure and private provider endpoints by default", () => {
     expect(assertSafeProviderUrl("https://openrouter.ai/api/v1/")).toBe("https://openrouter.ai/api/v1");
     expect(() => assertSafeProviderUrl("http://127.0.0.1:8000/v1")).toThrow();
+    expect(() => assertSafeProviderUrl("https://100.64.0.1/v1")).toThrow();
+    expect(() => assertSafeProviderUrl("https://[fd00::1]/v1")).toThrow();
+    expect(() => assertSafeProviderUrl("https://token@example.com/v1")).toThrow("credentials");
   });
 });

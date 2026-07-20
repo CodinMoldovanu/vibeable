@@ -34,6 +34,7 @@ export type Permission =
   | "ai_policy:update"
   | "metrics:read_global"
   | "metrics:read_team"
+  | "metrics:read_project"
   | "metrics:read_user"
   | "audit:read";
 
@@ -149,7 +150,7 @@ export interface AgentRun {
   userId: string;
   phase: AgentPhase;
   prompt: string;
-  status: "queued" | "planning" | "editing" | "testing" | "ready" | "failed";
+  status: "waiting_approval" | "queued" | "planning" | "editing" | "testing" | "ready" | "failed";
   providerId: string;
   model: string;
   totalTokens: number;

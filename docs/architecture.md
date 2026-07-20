@@ -21,7 +21,7 @@ flowchart LR
 
 - The browser never receives provider credentials. Sessions are opaque, hashed in PostgreSQL, HttpOnly, SameSite Strict, and Secure in production.
 - Every project query includes organization and team access constraints. API handlers enforce permissions before mutations.
-- Provider responses are untrusted. The orchestrator accepts one bounded JSON schema, rejects unsafe paths and symlinks, and limits file count and size.
+- Provider responses are untrusted. The orchestrator accepts one bounded JSON schema, rejects unsafe paths and symlinks, excludes common credential files from context, and limits file count and size.
 - Preview content is served from an authenticated endpoint in a sandboxed iframe with a restrictive content security policy.
 - Command execution is off by default. Docker mode applies resource limits, removes capabilities, disables networking, and sets `no-new-privileges`.
 
@@ -33,13 +33,14 @@ Prompt hooks matching the run phase are gathered from every applicable scope and
 
 ## Run lifecycle
 
-1. The API authorizes a project run and stores it as queued.
+1. The API authorizes a project run and stores it as queued or waiting for independent approval.
 2. The orchestrator resolves policy and checks current-month usage.
 3. It loads bounded text context from the project workspace.
 4. The selected endpoint returns structured whole-file edits.
-5. Path-safe edits are applied and persisted as run file metadata.
+5. A run-specific Git branch is created and path-safe edits are applied.
 6. Verification follows the configured execution mode.
 7. Usage and estimated cost are recorded from provider-reported token counts.
-8. Events are persisted and streamed. Reconnecting clients replay prior events.
+8. Successful edits are committed with run, user, provider, model, and usage metadata, then fast-forwarded to `main`.
+9. Events are persisted and streamed. Reconnecting clients replay prior events.
 
 The in-process orchestrator is suitable for one control-plane replica. Horizontal scaling requires a durable queue and dedicated workers before multiple replicas are started.

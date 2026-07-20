@@ -11,12 +11,12 @@
 
 | Threat | Current control | Residual risk |
 | --- | --- | --- |
-| Cross-tenant data access | Organization/team constraints in project lookups and permission checks | Route-level tests must expand with every endpoint |
+| Cross-tenant data access | Organization/team constraints, composite database foreign keys, permission checks, and PostgreSQL route tests | Route-level tests must expand with every endpoint |
 | Session theft | Random opaque tokens, hash-only storage, HttpOnly/SameSite cookies, Secure in production | Operators must terminate TLS correctly |
 | CSRF | SameSite Strict cookie, exact CORS origin, custom mutation header | Reverse proxies must not rewrite origin policy |
 | Provider-key disclosure | AES-256-GCM at rest, log redaction, server-only decryption | `MASTER_KEY` rotation is not automated yet |
 | Provider SSRF | HTTPS-only and private-address blocking by default | DNS rebinding protection needs a pinned resolver/egress proxy |
-| Malicious model output | JSON schema, path containment, symlink skipping, size limits | Generated application code remains untrusted |
+| Malicious model output | JSON schema, real-path containment, symlink rejection, secret-file context exclusions, size limits | Generated application code remains untrusted |
 | Host command execution | Disabled by default; Docker resource and privilege limits | Docker daemon access and dependency execution need a separate worker in shared production |
 | Preview attacks | Authenticated route, sandboxed iframe, restrictive CSP | Generated content should move to a separate origin before untrusted multi-user use |
 | Budget abuse | Effective monthly cap checked before calls, persisted exact usage | Concurrent calls can race the cap without reservations |

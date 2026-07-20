@@ -1,5 +1,5 @@
 import { z } from "zod";
-import { decryptSecret } from "./security.js";
+import { assertSafeProviderResolution, decryptSecret } from "./security.js";
 
 const editResponseSchema = z.object({
   summary: z.string().min(1).max(2000),
@@ -16,6 +16,8 @@ interface CompletionResponse {
   error?: { message?: string };
 }
 
+const MAX_PROVIDER_RESPONSE_BYTES = 8 * 1024 * 1024;
+
 export async function generateEdits(input: {
   baseUrl: string;
   encryptedApiKey: string | null;
@@ -23,23 +25,26 @@ export async function generateEdits(input: {
   userPrompt: string;
   hooks: string[];
   workspaceContext: string;
+  skipEndpointResolutionForTests?: boolean;
 }) {
   const controller = new AbortController();
   const timeout = setTimeout(() => controller.abort(), 180_000);
   try {
-    const response = await fetch(`${input.baseUrl.replace(/\/$/, "")}/chat/completions`, {
-      method: "POST",
-      signal: controller.signal,
-      headers: {
-        "content-type": "application/json",
-        ...(input.encryptedApiKey
-          ? { authorization: `Bearer ${decryptSecret(input.encryptedApiKey)}` }
-          : {})
-      },
-      body: JSON.stringify({
+    const baseUrl = input.skipEndpointResolutionForTests ? input.baseUrl.replace(/\/$/, "") : await assertSafeProviderResolution(input.baseUrl);
+    const request = async (jsonMode: boolean) => fetch(`${baseUrl}/chat/completions`, {
+        method: "POST",
+        redirect: "error",
+        signal: controller.signal,
+        headers: {
+          "content-type": "application/json",
+          ...(input.encryptedApiKey
+            ? { authorization: `Bearer ${decryptSecret(input.encryptedApiKey)}` }
+            : {})
+        },
+        body: JSON.stringify({
         model: input.model,
         temperature: 0.2,
-        response_format: { type: "json_object" },
+        ...(jsonMode ? { response_format: { type: "json_object" } } : {}),
         messages: [
           {
             role: "system",
@@ -57,7 +62,12 @@ export async function generateEdits(input: {
         ]
       })
     });
-    const payload = (await response.json()) as CompletionResponse;
+    let response = await request(true);
+    let payload = await readProviderResponse(response);
+    if (!response.ok && [400, 404, 422].includes(response.status) && /response.?format|json.?mode|unsupported/i.test(payload.error?.message ?? "")) {
+      response = await request(false);
+      payload = await readProviderResponse(response);
+    }
     if (!response.ok) throw new Error(payload.error?.message ?? `AI provider returned HTTP ${response.status}`);
     const content = payload.choices?.[0]?.message?.content;
     if (!content) throw new Error("AI provider returned no content");
@@ -73,5 +83,37 @@ export async function generateEdits(input: {
     };
   } finally {
     clearTimeout(timeout);
+  }
+}
+
+async function readProviderResponse(response: Response): Promise<CompletionResponse> {
+  const declaredLength = Number(response.headers.get("content-length") ?? 0);
+  if (declaredLength > MAX_PROVIDER_RESPONSE_BYTES) throw new Error("AI provider response exceeded the size limit");
+  if (!response.body) throw new Error("AI provider returned an empty response");
+  const reader = response.body.getReader();
+  const chunks: Uint8Array[] = [];
+  let total = 0;
+  while (true) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    total += value.byteLength;
+    if (total > MAX_PROVIDER_RESPONSE_BYTES) {
+      await reader.cancel();
+      throw new Error("AI provider response exceeded the size limit");
+    }
+    chunks.push(value);
+  }
+  const bytes = new Uint8Array(total);
+  let offset = 0;
+  for (const chunk of chunks) {
+    bytes.set(chunk, offset);
+    offset += chunk.byteLength;
+  }
+  const text = new TextDecoder().decode(bytes);
+  try {
+    return JSON.parse(text) as CompletionResponse;
+  } catch {
+    if (!response.ok) return { error: { message: text.slice(0, 1000) || `AI provider returned HTTP ${response.status}` } };
+    throw new Error("AI provider returned malformed JSON");
   }
 }

@@ -15,6 +15,7 @@ export const rolePermissions: Record<Role, Permission[]> = {
     "ai_policy:update",
     "metrics:read_global",
     "metrics:read_team",
+    "metrics:read_project",
     "metrics:read_user",
     "audit:read"
   ],
@@ -30,6 +31,7 @@ export const rolePermissions: Record<Role, Permission[]> = {
     "secret:update",
     "ai_policy:update",
     "metrics:read_team",
+    "metrics:read_project",
     "metrics:read_user",
     "audit:read"
   ],
@@ -38,11 +40,11 @@ export const rolePermissions: Record<Role, Permission[]> = {
     "project:read",
     "project:update",
     "agent:run",
-    "agent:approve_changes",
     "deployment:create",
+    "metrics:read_project",
     "metrics:read_user"
   ],
-  reviewer: ["project:read", "deployment:approve", "metrics:read_team"],
+  reviewer: ["project:read", "agent:approve_changes", "deployment:approve", "metrics:read_team", "metrics:read_project"],
   viewer: ["project:read"]
 };
 

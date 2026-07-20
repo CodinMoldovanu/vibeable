@@ -1,12 +1,13 @@
 import { execFile } from "node:child_process";
-import { mkdir, readFile, readdir, stat, writeFile } from "node:fs/promises";
-import { dirname, join, relative, resolve, sep } from "node:path";
+import { lstat, mkdir, readFile, readdir, realpath, stat, writeFile } from "node:fs/promises";
+import { join, relative, resolve, sep } from "node:path";
 import { promisify } from "node:util";
 import { config } from "./config.js";
 
 const execFileAsync = promisify(execFile);
 const MAX_CONTEXT_BYTES = 120_000;
-const ignored = new Set([".git", "node_modules", "dist", ".env"]);
+const ignored = new Set([".git", "node_modules", "dist"]);
+const sensitiveNames = /(?:^\.env(?:\.|$)|\.pem$|\.key$|^id_(?:rsa|dsa|ecdsa|ed25519)$|credentials|secrets?)/i;
 
 export function projectDirectory(projectId: string) {
   return join(config.DATA_DIR, "projects", projectId);
@@ -21,7 +22,46 @@ export async function ensureWorkspace(projectId: string, projectName: string) {
   } catch {
     await writeFile(indexPath, starterHtml(projectName), { encoding: "utf8", flag: "wx" });
   }
+  const gitignorePath = join(directory, ".gitignore");
+  try {
+    await stat(gitignorePath);
+  } catch {
+    await writeFile(gitignorePath, ".env\n.env.*\nnode_modules\ndist\n", { encoding: "utf8", flag: "wx" });
+  }
+  await initializeRepository(directory);
   return directory;
+}
+
+export async function prepareRunBranch(directory: string, runId: string) {
+  await initializeRepository(directory);
+  await git(directory, ["checkout", "main"]);
+  await git(directory, ["reset", "--hard", "HEAD"]);
+  await git(directory, ["clean", "-fd"]);
+  await git(directory, ["checkout", "-B", `agent/${runId}`]);
+}
+
+export async function commitRun(directory: string, input: { runId: string; userId: string; providerId: string; model: string; totalTokens: number }) {
+  await git(directory, ["add", "-A"]);
+  const status = await git(directory, ["status", "--porcelain"]);
+  if (status.stdout.trim()) {
+    await git(directory, [
+      "commit",
+      "-m", `Agent run ${input.runId.slice(0, 8)}`,
+      "-m", `Run-Id: ${input.runId}\nUser-Id: ${input.userId}\nProvider-Id: ${input.providerId}\nModel: ${input.model}\nTotal-Tokens: ${input.totalTokens}`
+    ]);
+  }
+  return (await git(directory, ["rev-parse", "HEAD"])).stdout.trim();
+}
+
+export async function finalizeRunBranch(directory: string, runId: string) {
+  await git(directory, ["checkout", "main"]);
+  await git(directory, ["merge", "--ff-only", `agent/${runId}`]);
+}
+
+export async function abortRunBranch(directory: string, runId: string) {
+  await git(directory, ["reset", "--hard", "HEAD"]).catch(() => undefined);
+  await git(directory, ["checkout", "main"]).catch(() => undefined);
+  await git(directory, ["branch", "-D", `agent/${runId}`]).catch(() => undefined);
 }
 
 export async function workspaceContext(directory: string) {
@@ -40,14 +80,21 @@ export async function workspaceContext(directory: string) {
 }
 
 export async function applyEdits(directory: string, files: Array<{ path: string; content: string; summary: string }>) {
+  const root = await realpath(directory);
   const changes: Array<{ path: string; additions: number; deletions: number; summary: string }> = [];
   for (const file of files) {
-    const destination = resolve(directory, file.path);
-    if (!destination.startsWith(`${resolve(directory)}${sep}`) || file.path.includes("..") || file.path.startsWith("/")) {
+    const destination = resolve(root, file.path);
+    const segments = relative(root, destination).split(sep);
+    if (!isContained(root, destination) || segments.some((segment) => !segment || segment === "." || segment === "..") || file.path.includes("\0")) {
       throw new Error(`Unsafe generated path: ${file.path}`);
     }
+    await ensureSafeParent(root, segments.slice(0, -1));
+    const target = await lstat(destination).catch((error: NodeJS.ErrnoException) => {
+      if (error.code === "ENOENT") return null;
+      throw error;
+    });
+    if (target?.isSymbolicLink() || target?.isDirectory()) throw new Error(`Unsafe generated path: ${file.path}`);
     const before = await readFile(destination, "utf8").catch(() => "");
-    await mkdir(dirname(destination), { recursive: true });
     await writeFile(destination, file.content, "utf8");
     changes.push({
       path: file.path,
@@ -83,25 +130,68 @@ export async function verifyWorkspace(directory: string) {
 }
 
 export async function readPreview(projectId: string, requestedPath = "index.html") {
-  const directory = projectDirectory(projectId);
-  const destination = resolve(directory, requestedPath || "index.html");
-  if (!destination.startsWith(`${resolve(directory)}${sep}`) && destination !== join(resolve(directory), "index.html")) {
+  return readContainedFile(projectDirectory(projectId), requestedPath);
+}
+
+export async function readContainedFile(directory: string, requestedPath = "index.html") {
+  const root = await realpath(directory);
+  const destination = resolve(root, requestedPath || "index.html");
+  if (!isContained(root, destination)) {
     throw Object.assign(new Error("Invalid preview path"), { statusCode: 400 });
   }
-  return readFile(destination);
+  const target = await lstat(destination).catch((error: NodeJS.ErrnoException) => {
+    if (error.code === "ENOENT") throw Object.assign(new Error("Preview file not found"), { statusCode: 404 });
+    throw error;
+  });
+  if (target.isSymbolicLink() || !target.isFile()) throw Object.assign(new Error("Invalid preview path"), { statusCode: 400 });
+  const resolvedTarget = await realpath(destination);
+  if (!isContained(root, resolvedTarget)) throw Object.assign(new Error("Invalid preview path"), { statusCode: 400 });
+  return readFile(resolvedTarget);
 }
 
 async function walk(directory: string): Promise<string[]> {
   const entries = await readdir(directory, { withFileTypes: true });
   const result: string[] = [];
   for (const entry of entries) {
-    if (ignored.has(entry.name)) continue;
+    if (ignored.has(entry.name) || sensitiveNames.test(entry.name)) continue;
     const path = join(directory, entry.name);
     if (entry.isSymbolicLink()) continue;
     if (entry.isDirectory()) result.push(...await walk(path));
     else if (entry.isFile()) result.push(path);
   }
   return result.sort();
+}
+
+async function ensureSafeParent(root: string, segments: string[]) {
+  let current = root;
+  for (const segment of segments) {
+    const next = join(current, segment);
+    const existing = await lstat(next).catch((error: NodeJS.ErrnoException) => {
+      if (error.code === "ENOENT") return null;
+      throw error;
+    });
+    if (!existing) await mkdir(next);
+    else if (existing.isSymbolicLink() || !existing.isDirectory()) throw new Error(`Unsafe workspace directory: ${segment}`);
+    current = next;
+  }
+}
+
+function isContained(root: string, candidate: string) {
+  return candidate.startsWith(`${root}${sep}`);
+}
+
+async function initializeRepository(directory: string) {
+  const repository = await stat(join(directory, ".git")).catch(() => null);
+  if (repository?.isDirectory()) return;
+  await git(directory, ["init", "-b", "main"]);
+  await git(directory, ["config", "user.name", "Vibeable Agent"]);
+  await git(directory, ["config", "user.email", "agent@vibeable.local"]);
+  await git(directory, ["add", "-A"]);
+  await git(directory, ["commit", "-m", "Initialize Vibeable project"]);
+}
+
+async function git(directory: string, args: string[]) {
+  return execFileAsync("git", args, { cwd: directory, timeout: 30_000, maxBuffer: 2_000_000 });
 }
 
 function countChangedLines(left: string, right: string) {

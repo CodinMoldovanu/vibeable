@@ -1,21 +1,9 @@
-import { readdir, readFile } from "node:fs/promises";
-import { join } from "node:path";
-import { pool, transaction } from "../db.js";
+import { pool } from "../db.js";
+import { migrate } from "../migrate.js";
 
-const migrationsDir = join(process.cwd(), "server", "migrations");
-
-await pool.query("CREATE TABLE IF NOT EXISTS schema_migrations (version text PRIMARY KEY, applied_at timestamptz NOT NULL DEFAULT now())");
-const files = (await readdir(migrationsDir)).filter((file) => file.endsWith(".sql")).sort();
-
-for (const file of files) {
-  const exists = await pool.query("SELECT 1 FROM schema_migrations WHERE version = $1", [file]);
-  if (exists.rowCount) continue;
-  const sql = await readFile(join(migrationsDir, file), "utf8");
-  await transaction(async (client) => {
-    await client.query(sql);
-    await client.query("INSERT INTO schema_migrations (version) VALUES ($1) ON CONFLICT DO NOTHING", [file]);
-  });
-  process.stdout.write(`Applied ${file}\n`);
+try {
+  const files = await migrate(pool);
+  process.stdout.write(`Database is current (${files.length} migration(s)).\n`);
+} finally {
+  await pool.end();
 }
-
-await pool.end();

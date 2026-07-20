@@ -8,6 +8,9 @@ export const pool = new Pool({
   max: 20,
   idleTimeoutMillis: 30_000,
   connectionTimeoutMillis: 5_000,
+  statement_timeout: 15_000,
+  query_timeout: 20_000,
+  application_name: "vibeable",
   ssl: config.DATABASE_SSL === "disable"
     ? undefined
     : { rejectUnauthorized: config.DATABASE_SSL === "verify-full" }

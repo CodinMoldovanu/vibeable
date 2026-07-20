@@ -1,4 +1,3 @@
-import { access } from "node:fs/promises";
 import { extname, join } from "node:path";
 import fastifyCookie from "@fastify/cookie";
 import fastifyCors from "@fastify/cors";
@@ -9,11 +8,12 @@ import { hash } from "bcryptjs";
 import Fastify, { type FastifyInstance } from "fastify";
 import { z, ZodError } from "zod";
 import type { AgentPhase, Permission, Role, ScopeType } from "../src/domain/types.js";
+import { can } from "../src/domain/rbac.js";
 import { authenticate, createSession, destroySession, getPrincipal, requirePrincipal } from "./auth.js";
 import { config } from "./config.js";
 import { pool, query, transaction } from "./db.js";
 import { subscribeToRun } from "./events.js";
-import { enqueueRun } from "./orchestrator.js";
+import { enqueueRun, recordRunEvent } from "./orchestrator.js";
 import { requirePermission } from "./permissions.js";
 import { resolvePolicy } from "./policy.js";
 import { assertSafeProviderUrl, encryptSecret } from "./security.js";
@@ -39,7 +39,21 @@ export function buildApp() {
 
   void app.register(fastifyCookie);
   void app.register(fastifyCors, { origin: config.PUBLIC_URL, credentials: true, methods: ["GET", "POST", "PATCH", "DELETE"] });
-  void app.register(fastifyHelmet, { contentSecurityPolicy: false });
+  void app.register(fastifyHelmet, {
+    contentSecurityPolicy: {
+      directives: {
+        defaultSrc: ["'self'"],
+        scriptSrc: ["'self'"],
+        styleSrc: ["'self'", "'unsafe-inline'"],
+        imgSrc: ["'self'", "data:"],
+        connectSrc: ["'self'"],
+        frameSrc: ["'self'"],
+        objectSrc: ["'none'"],
+        baseUri: ["'self'"],
+        frameAncestors: ["'none'"]
+      }
+    }
+  });
   void app.register(fastifyRateLimit, { max: 300, timeWindow: "1 minute" });
 
   app.addHook("onRequest", async (request, reply) => {
@@ -74,11 +88,12 @@ export function buildApp() {
       providerModel: z.string().trim().min(1).max(200).default("openai/gpt-5-mini"),
       apiKey: z.string().max(1000).optional()
     }).parse(request.body);
-    const existing = await query("SELECT 1 FROM users LIMIT 1");
-    if (existing.rowCount) return reply.code(409).send({ error: "Instance is already bootstrapped" });
     const passwordHash = await hash(input.password, 12);
     const baseUrl = assertSafeProviderUrl(input.providerUrl);
     const userId = await transaction(async (client) => {
+      await client.query("SELECT pg_advisory_xact_lock(hashtext('vibeable:bootstrap'))");
+      const existing = await client.query("SELECT 1 FROM users LIMIT 1");
+      if (existing.rowCount) throw Object.assign(new Error("Instance is already bootstrapped"), { statusCode: 409 });
       const org = await client.query<{ id: string }>(
         "INSERT INTO organizations (name, slug) VALUES ($1, $2) RETURNING id",
         [input.organizationName, slugify(input.organizationName)]
@@ -185,7 +200,8 @@ export function buildApp() {
     const { projectId } = z.object({ projectId: idSchema }).parse(request.params);
     await getAccessibleProject(principal, projectId);
     const result = await query(
-      `SELECT r.id, r.phase, r.prompt, r.status, r.model, r.total_tokens AS "totalTokens",
+      `SELECT r.id, r.phase, r.prompt, r.status, r.model, r.commit_sha AS "commitSha", r.total_tokens AS "totalTokens",
+              r.user_id AS "userId",
               r.estimated_cost_usd::float8 AS "estimatedCostUsd", r.created_at AS "createdAt",
               coalesce((SELECT json_agg(json_build_object('sequence', e.sequence, 'type', e.type, 'message', e.message, 'metadata', e.metadata, 'createdAt', e.created_at) ORDER BY e.sequence)
                 FROM agent_run_events e WHERE e.run_id = r.id), '[]') AS events,
@@ -203,16 +219,49 @@ export function buildApp() {
     const { projectId } = z.object({ projectId: idSchema }).parse(request.params);
     const input = z.object({ prompt: z.string().trim().min(3).max(50_000), phase: phaseSchema.default("agent:before_edit") }).parse(request.body);
     const project = await getAccessibleProject(principal, projectId);
+    const policy = await resolvePolicy({
+      organizationId: principal.organizationId,
+      teamId: project.teamId,
+      userId: principal.userId,
+      projectId: project.id,
+      phase: input.phase
+    });
+    const status = policy.requireApproval ? "waiting_approval" : "queued";
     const result = await query<{ id: string }>(
-      `INSERT INTO agent_runs (organization_id, team_id, project_id, user_id, phase, prompt)
-       VALUES ($1,$2,$3,$4,$5,$6) RETURNING id`,
-      [principal.organizationId, project.teamId, project.id, principal.userId, input.phase, input.prompt]
+      `INSERT INTO agent_runs (organization_id, team_id, project_id, user_id, phase, prompt, status, provider_id, model)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9) RETURNING id`,
+      [principal.organizationId, project.teamId, project.id, principal.userId, input.phase, input.prompt,
+        status, policy.provider.id, policy.model]
     );
     const run = result.rows[0]!;
     await query("UPDATE projects SET status = 'building', updated_at = now() WHERE id = $1", [project.id]);
-    await writeAudit(principal, "agent_run.created", "agent_run", run.id, { projectId: project.id, phase: input.phase }, request.ip);
-    enqueueRun(run.id);
-    return reply.code(202).send({ id: run.id, status: "queued" });
+    await writeAudit(principal, "agent_run.created", "agent_run", run.id, { projectId: project.id, phase: input.phase, status }, request.ip);
+    if (status === "waiting_approval") {
+      await recordRunEvent(run.id, "approval", "Run is waiting for an authorized approver");
+    } else {
+      enqueueRun(run.id);
+    }
+    return reply.code(202).send({ id: run.id, status });
+  });
+
+  app.post("/api/runs/:runId/approve", async (request, reply) => {
+    const principal = await requirePrincipal(request);
+    requirePermission(principal, "agent:approve_changes");
+    const { runId } = z.object({ runId: idSchema }).parse(request.params);
+    const existing = await query<{ project_id: string }>("SELECT project_id FROM agent_runs WHERE id = $1 AND organization_id = $2", [runId, principal.organizationId]);
+    if (!existing.rows[0]) return reply.code(404).send({ error: "Run not found" });
+    await getAccessibleProject(principal, existing.rows[0].project_id);
+    const result = await query<{ id: string }>(
+      `UPDATE agent_runs SET status='queued', approved_by=$2, approved_at=now()
+        WHERE id=$1 AND organization_id=$3 AND status='waiting_approval'
+          AND ($4::boolean = false OR user_id <> $2) RETURNING id`,
+      [runId, principal.userId, principal.organizationId, config.requireSeparateApprover]
+    );
+    if (!result.rows[0]) throw Object.assign(new Error("Run is not awaiting approval or requires a different approver"), { statusCode: 409 });
+    await recordRunEvent(runId, "approval", `Approved by ${principal.name}`);
+    await writeAudit(principal, "agent_run.approved", "agent_run", runId, {}, request.ip);
+    enqueueRun(runId);
+    return { ok: true };
   });
 
   app.get("/api/runs/:runId/events", async (request, reply) => {
@@ -275,7 +324,7 @@ export function buildApp() {
 
   if (config.NODE_ENV === "production") {
     const root = join(process.cwd(), "dist");
-    void access(root).then(() => app.register(fastifyStatic, { root, wildcard: false })).catch(() => undefined);
+    void app.register(fastifyStatic, { root, wildcard: false });
     app.setNotFoundHandler((request, reply) => {
       if (request.url.startsWith("/api/") || request.url === "/healthz") return reply.code(404).send({ error: "Not found" });
       return reply.sendFile("index.html");
@@ -331,6 +380,19 @@ function registerAdminRoutes(app: FastifyInstance) {
     });
     await writeAudit(principal, "user.created", "user", userId, { email: input.email, role: input.role, teamId: input.teamId }, request.ip);
     return reply.code(201).send({ id: userId });
+  });
+  app.post("/api/admin/memberships", async (request, reply) => {
+    const principal = await requirePrincipal(request); requirePermission(principal, "org:manage");
+    const input = z.object({ userId: idSchema, teamId: idSchema, role: z.enum(["admin", "developer", "reviewer", "viewer"]) }).parse(request.body);
+    await assertScope(principal.organizationId, "user", input.userId);
+    await assertScope(principal.organizationId, "team", input.teamId);
+    await query(
+      `INSERT INTO memberships (organization_id, team_id, user_id, role) VALUES ($1,$2,$3,$4)
+       ON CONFLICT (organization_id, user_id, team_id) DO UPDATE SET role=excluded.role`,
+      [principal.organizationId, input.teamId, input.userId, input.role]
+    );
+    await writeAudit(principal, "membership.upserted", "user", input.userId, { teamId: input.teamId, role: input.role }, request.ip);
+    return reply.code(201).send({ ok: true });
   });
   app.get("/api/admin/providers", async (request) => {
     const principal = await requirePrincipal(request); requirePermission(principal, "ai_policy:update");
@@ -408,13 +470,64 @@ function registerAdminRoutes(app: FastifyInstance) {
 }
 
 function registerMetricsRoutes(app: FastifyInstance) {
+  app.get("/api/metrics/scopes", async (request) => {
+    const principal = await requirePrincipal(request);
+    const scopes: Array<{ scope: ScopeType; id: string; label: string }> = [];
+    if (can(principal.role, "metrics:read_global")) scopes.push({ scope: "global", id: principal.organizationId, label: principal.organizationName });
+    if (can(principal.role, "metrics:read_team")) {
+      const allTeams = ["owner", "admin"].includes(principal.role);
+      const teams = await query<{ id: string; name: string }>(
+        `SELECT t.id, t.name FROM teams t WHERE t.organization_id=$1 AND ($2::boolean OR EXISTS
+          (SELECT 1 FROM memberships m WHERE m.team_id=t.id AND m.user_id=$3)) ORDER BY t.name`,
+        [principal.organizationId, allTeams, principal.userId]
+      );
+      scopes.push(...teams.rows.map((team) => ({ scope: "team" as const, id: team.id, label: team.name })));
+    }
+    if (can(principal.role, "metrics:read_user")) {
+      const allUsers = ["owner", "admin"].includes(principal.role);
+      const users = await query<{ id: string; name: string }>(
+        `SELECT u.id, u.name FROM users u JOIN memberships m ON m.user_id=u.id AND m.team_id IS NULL
+          WHERE m.organization_id=$1 AND ($2::boolean OR u.id=$3) ORDER BY u.name`,
+        [principal.organizationId, allUsers, principal.userId]
+      );
+      scopes.push(...users.rows.map((user) => ({ scope: "user" as const, id: user.id, label: user.name })));
+    }
+    if (can(principal.role, "metrics:read_project")) {
+      const allProjects = ["owner", "admin"].includes(principal.role);
+      const projects = await query<{ id: string; name: string }>(
+        `SELECT p.id, p.name FROM projects p WHERE p.organization_id=$1 AND ($2::boolean OR EXISTS
+          (SELECT 1 FROM memberships m WHERE m.team_id=p.team_id AND m.user_id=$3)) ORDER BY p.name`,
+        [principal.organizationId, allProjects, principal.userId]
+      );
+      scopes.push(...projects.rows.map((project) => ({ scope: "project" as const, id: project.id, label: project.name })));
+    }
+    return { scopes };
+  });
+
   app.get("/api/metrics/usage", async (request) => {
     const principal = await requirePrincipal(request);
     const input = z.object({ scope: z.enum(["global", "team", "user", "project"]).default("user"), id: idSchema.optional(), days: z.coerce.number().int().min(1).max(365).default(30) }).parse(request.query);
-    const permission: Permission = input.scope === "global" ? "metrics:read_global" : input.scope === "team" ? "metrics:read_team" : "metrics:read_user";
+    const permissionsByScope: Record<typeof input.scope, Permission> = {
+      global: "metrics:read_global",
+      team: "metrics:read_team",
+      project: "metrics:read_project",
+      user: "metrics:read_user"
+    };
+    const permission = permissionsByScope[input.scope];
     requirePermission(principal, permission);
-    const scopeId = input.scope === "global" ? principal.organizationId : input.id ?? principal.userId;
-    if (input.scope === "user" && !["owner", "admin"].includes(principal.role) && scopeId !== principal.userId) throw Object.assign(new Error("User metrics access denied"), { statusCode: 403 });
+    const scopeId = input.scope === "global" ? principal.organizationId : input.scope === "user" ? input.id ?? principal.userId : input.id;
+    if (!scopeId) throw Object.assign(new Error(`${input.scope} metrics require an id`), { statusCode: 400 });
+    if (input.scope === "team" && !["owner", "admin"].includes(principal.role)) {
+      const teamIds = await listMemberTeamIds(principal);
+      if (!teamIds.includes(scopeId)) throw Object.assign(new Error("Team metrics access denied"), { statusCode: 403 });
+    }
+    if (input.scope === "user") {
+      if (!["owner", "admin"].includes(principal.role) && scopeId !== principal.userId) {
+        throw Object.assign(new Error("User metrics access denied"), { statusCode: 403 });
+      }
+      await assertScope(principal.organizationId, "user", scopeId);
+    }
+    if (input.scope === "project") await getAccessibleProject(principal, scopeId);
     const column = { global: "organization_id", team: "team_id", user: "user_id", project: "project_id" }[input.scope];
     const result = await query(
       `SELECT date_trunc('day', completed_at) AS day, model, sum(input_tokens)::int AS "inputTokens",
@@ -432,7 +545,12 @@ function registerDeploymentRoutes(app: FastifyInstance) {
   app.get("/api/projects/:projectId/deployments", async (request) => {
     const principal = await requirePrincipal(request); const { projectId } = z.object({ projectId: idSchema }).parse(request.params);
     await getAccessibleProject(principal, projectId);
-    const result = await query("SELECT * FROM deployments WHERE project_id = $1 ORDER BY created_at DESC", [projectId]);
+    const result = await query(
+      `SELECT id, environment, status, requested_by AS "requestedBy", approved_by AS "approvedBy",
+              commit_sha AS "commitSha", created_at AS "createdAt", updated_at AS "updatedAt"
+         FROM deployments WHERE project_id = $1 ORDER BY created_at DESC`,
+      [projectId]
+    );
     return { deployments: result.rows };
   });
   app.post("/api/projects/:projectId/deployments", async (request, reply) => {
@@ -452,10 +570,11 @@ function registerDeploymentRoutes(app: FastifyInstance) {
     const { deploymentId } = z.object({ deploymentId: idSchema }).parse(request.params);
     const result = await query<{ id: string }>(
       `UPDATE deployments SET status='approved', approved_by=$2, updated_at=now()
-        WHERE id=$1 AND organization_id=$3 AND status='waiting_approval' RETURNING id`,
-      [deploymentId, principal.userId, principal.organizationId]
+        WHERE id=$1 AND organization_id=$3 AND status='waiting_approval'
+          AND ($4::boolean = false OR requested_by <> $2) RETURNING id`,
+      [deploymentId, principal.userId, principal.organizationId, config.requireSeparateApprover]
     );
-    if (!result.rows[0]) throw Object.assign(new Error("Deployment is not awaiting approval"), { statusCode: 409 });
+    if (!result.rows[0]) throw Object.assign(new Error("Deployment is not awaiting approval or requires a different approver"), { statusCode: 409 });
     await writeAudit(principal, "deployment.approved", "deployment", deploymentId, {}, request.ip);
     return { ok: true };
   });
