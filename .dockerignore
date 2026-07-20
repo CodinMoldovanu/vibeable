@@ -1,0 +1,9 @@
+.git
+.github
+.vibeable
+dist
+dist-server
+node_modules
+coverage
+.env*
+npm-debug.log*

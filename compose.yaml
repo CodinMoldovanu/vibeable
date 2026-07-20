@@ -1,0 +1,49 @@
+services:
+  postgres:
+    image: postgres:17-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: vibeable
+      POSTGRES_USER: vibeable
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD}
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U vibeable -d vibeable"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+    networks: [control]
+
+  vibeable:
+    build: .
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      NODE_ENV: production
+      HOST: 0.0.0.0
+      PORT: 8787
+      PUBLIC_URL: ${PUBLIC_URL:-http://localhost:8787}
+      DATABASE_URL: postgres://vibeable:${POSTGRES_PASSWORD}@postgres:5432/vibeable
+      DATABASE_SSL: disable
+      MASTER_KEY: ${MASTER_KEY:?set MASTER_KEY}
+      COOKIE_SECURE: ${COOKIE_SECURE:-false}
+      TRUST_PROXY: ${TRUST_PROXY:-false}
+      EXECUTION_MODE: ${EXECUTION_MODE:-disabled}
+      ALLOW_PRIVATE_AI_ENDPOINTS: ${ALLOW_PRIVATE_AI_ENDPOINTS:-false}
+    ports:
+      - "${VIBEABLE_PORT:-8787}:8787"
+    volumes:
+      - workspace-data:/data
+    networks: [control]
+    security_opt: [no-new-privileges:true]
+    cap_drop: [ALL]
+
+networks:
+  control:
+
+volumes:
+  postgres-data:
+  workspace-data:

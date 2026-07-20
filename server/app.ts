@@ -1,0 +1,495 @@
+import { access } from "node:fs/promises";
+import { extname, join } from "node:path";
+import fastifyCookie from "@fastify/cookie";
+import fastifyCors from "@fastify/cors";
+import fastifyHelmet from "@fastify/helmet";
+import fastifyRateLimit from "@fastify/rate-limit";
+import fastifyStatic from "@fastify/static";
+import { hash } from "bcryptjs";
+import Fastify, { type FastifyInstance } from "fastify";
+import { z, ZodError } from "zod";
+import type { AgentPhase, Permission, Role, ScopeType } from "../src/domain/types.js";
+import { authenticate, createSession, destroySession, getPrincipal, requirePrincipal } from "./auth.js";
+import { config } from "./config.js";
+import { pool, query, transaction } from "./db.js";
+import { subscribeToRun } from "./events.js";
+import { enqueueRun } from "./orchestrator.js";
+import { requirePermission } from "./permissions.js";
+import { resolvePolicy } from "./policy.js";
+import { assertSafeProviderUrl, encryptSecret } from "./security.js";
+import { getAccessibleProject, listMemberTeamIds, writeAudit } from "./store.js";
+import { ensureWorkspace, readPreview } from "./workspace.js";
+
+const idSchema = z.string().uuid();
+const phaseSchema = z.enum([
+  "project:create", "agent:before_plan", "agent:before_edit", "agent:after_edit", "agent:after_error",
+  "agent:before_test", "agent:after_test_failure", "deploy:prepare", "deploy:preflight",
+  "deploy:post_success", "deploy:post_failure", "summarize_logs", "classify_error",
+  "generate_commit_message", "database_migration", "production_deploy_prepare"
+]);
+const scopeSchema = z.enum(["global", "team", "user", "project"]);
+
+export function buildApp() {
+  const app = Fastify({
+    logger: { level: config.LOG_LEVEL, redact: ["req.headers.authorization", "req.headers.cookie", "body.password", "body.apiKey"] },
+    trustProxy: config.trustProxy,
+    bodyLimit: 1_100_000,
+    requestTimeout: 30_000
+  });
+
+  void app.register(fastifyCookie);
+  void app.register(fastifyCors, { origin: config.PUBLIC_URL, credentials: true, methods: ["GET", "POST", "PATCH", "DELETE"] });
+  void app.register(fastifyHelmet, { contentSecurityPolicy: false });
+  void app.register(fastifyRateLimit, { max: 300, timeWindow: "1 minute" });
+
+  app.addHook("onRequest", async (request, reply) => {
+    if (request.url.startsWith("/api/") && !["GET", "HEAD", "OPTIONS"].includes(request.method) &&
+        !request.url.startsWith("/api/auth/") && request.headers["x-vibeable-csrf"] !== "1") {
+      return reply.code(403).send({ error: "Missing CSRF header" });
+    }
+  });
+
+  app.get("/healthz", async (_request, reply) => {
+    try {
+      await query("SELECT 1");
+      return { status: "ok", database: "ok", executionMode: config.EXECUTION_MODE };
+    } catch {
+      return reply.code(503).send({ status: "error", database: "unavailable" });
+    }
+  });
+
+  app.get("/api/auth/setup-status", async () => {
+    const result = await query<{ count: string }>("SELECT count(*)::text AS count FROM users");
+    return { needsBootstrap: Number(result.rows[0]?.count ?? 0) === 0 };
+  });
+
+  app.post("/api/auth/bootstrap", { config: { rateLimit: { max: 5, timeWindow: "1 hour" } } }, async (request, reply) => {
+    const input = z.object({
+      organizationName: z.string().trim().min(2).max(100),
+      name: z.string().trim().min(2).max(100),
+      email: z.string().email().max(254),
+      password: z.string().min(12).max(200),
+      providerName: z.string().trim().min(2).max(100).default("OpenRouter"),
+      providerUrl: z.string().url().default("https://openrouter.ai/api/v1"),
+      providerModel: z.string().trim().min(1).max(200).default("openai/gpt-5-mini"),
+      apiKey: z.string().max(1000).optional()
+    }).parse(request.body);
+    const existing = await query("SELECT 1 FROM users LIMIT 1");
+    if (existing.rowCount) return reply.code(409).send({ error: "Instance is already bootstrapped" });
+    const passwordHash = await hash(input.password, 12);
+    const baseUrl = assertSafeProviderUrl(input.providerUrl);
+    const userId = await transaction(async (client) => {
+      const org = await client.query<{ id: string }>(
+        "INSERT INTO organizations (name, slug) VALUES ($1, $2) RETURNING id",
+        [input.organizationName, slugify(input.organizationName)]
+      );
+      const organizationId = org.rows[0]!.id;
+      const user = await client.query<{ id: string }>(
+        "INSERT INTO users (email, name, password_hash) VALUES (lower($1), $2, $3) RETURNING id",
+        [input.email, input.name, passwordHash]
+      );
+      const ownerId = user.rows[0]!.id;
+      const team = await client.query<{ id: string }>(
+        "INSERT INTO teams (organization_id, name, slug) VALUES ($1, 'Default', 'default') RETURNING id",
+        [organizationId]
+      );
+      await client.query(
+        "INSERT INTO memberships (organization_id, team_id, user_id, role) VALUES ($1, NULL, $2, 'owner'), ($1, $3, $2, 'owner')",
+        [organizationId, ownerId, team.rows[0]!.id]
+      );
+      const provider = await client.query<{ id: string }>(
+        `INSERT INTO ai_providers
+          (organization_id, name, base_url, encrypted_api_key, default_model, allowed_models)
+         VALUES ($1, $2, $3, $4, $5, $6) RETURNING id`,
+        [organizationId, input.providerName, baseUrl, input.apiKey ? encryptSecret(input.apiKey) : null,
+          input.providerModel, JSON.stringify([input.providerModel])]
+      );
+      await client.query(
+        `INSERT INTO ai_policies
+          (organization_id, scope_type, scope_id, default_provider_id, default_model, allowed_provider_ids,
+           allowed_models, monthly_token_limit, monthly_cost_limit_usd, allow_user_override)
+         VALUES ($1, 'global', $1, $2, $3, $4, $5, 10000000, 500, true)`,
+        [organizationId, provider.rows[0]!.id, input.providerModel, JSON.stringify([provider.rows[0]!.id]), JSON.stringify([input.providerModel])]
+      );
+      await client.query(
+        `INSERT INTO prompt_hooks (organization_id, scope_type, scope_id, phase, priority, mandatory, title, prompt)
+         VALUES ($1, 'global', $1, 'deploy:prepare', 100, true, 'Production readiness',
+         'Before deployment, run tests and builds, provide a health endpoint, use runtime-injected secrets, and make migrations reversible.')`,
+        [organizationId]
+      );
+      return ownerId;
+    });
+    await createSession(userId, reply);
+    return reply.code(201).send({ ok: true });
+  });
+
+  app.post("/api/auth/login", { config: { rateLimit: { max: 10, timeWindow: "15 minutes" } } }, async (request, reply) => {
+    const input = z.object({ email: z.string().email(), password: z.string().min(1).max(200) }).parse(request.body);
+    const userId = await authenticate(input.email, input.password);
+    if (!userId) return reply.code(401).send({ error: "Invalid email or password" });
+    await createSession(userId, reply);
+    return { ok: true };
+  });
+
+  app.post("/api/auth/logout", async (request, reply) => {
+    await destroySession(request, reply);
+    return { ok: true };
+  });
+
+  app.get("/api/session", async (request, reply) => {
+    const principal = await getPrincipal(request);
+    if (!principal) return reply.code(401).send({ error: "Authentication required" });
+    const teams = await query<{ id: string; name: string; role: Role }>(
+      `SELECT t.id, t.name, m.role FROM memberships m JOIN teams t ON t.id = m.team_id
+        WHERE m.user_id = $1 AND m.organization_id = $2`,
+      [principal.userId, principal.organizationId]
+    );
+    return { user: principal, teams: teams.rows };
+  });
+
+  app.get("/api/projects", async (request) => {
+    const principal = await requirePrincipal(request);
+    const allTeams = ["owner", "admin"].includes(principal.role);
+    const result = await query(
+      `SELECT p.id, p.name, p.slug, p.status, p.environment, p.team_id AS "teamId", t.name AS "teamName",
+              p.updated_at AS "updatedAt", '/api/projects/' || p.id || '/preview/' AS "previewUrl"
+         FROM projects p JOIN teams t ON t.id = p.team_id
+        WHERE p.organization_id = $1 AND ($2::boolean OR EXISTS (
+          SELECT 1 FROM memberships m WHERE m.user_id = $3 AND m.team_id = p.team_id))
+        ORDER BY p.updated_at DESC`,
+      [principal.organizationId, allTeams, principal.userId]
+    );
+    return { projects: result.rows };
+  });
+
+  app.post("/api/projects", async (request, reply) => {
+    const principal = await requirePrincipal(request);
+    requirePermission(principal, "project:create");
+    const input = z.object({ name: z.string().trim().min(2).max(100), teamId: idSchema }).parse(request.body);
+    const teamIds = await listMemberTeamIds(principal);
+    if (!["owner", "admin"].includes(principal.role) && !teamIds.includes(input.teamId)) return reply.code(403).send({ error: "Team access denied" });
+    const result = await query<{ id: string }>(
+      `INSERT INTO projects (organization_id, team_id, owner_id, name, slug, status)
+       SELECT $1, id, $2, $3, $4, 'draft' FROM teams WHERE id = $5 AND organization_id = $1 RETURNING id`,
+      [principal.organizationId, principal.userId, input.name, `${slugify(input.name)}-${Date.now().toString(36)}`, input.teamId]
+    );
+    const project = result.rows[0];
+    if (!project) return reply.code(404).send({ error: "Team not found" });
+    await ensureWorkspace(project.id, input.name);
+    await writeAudit(principal, "project.created", "project", project.id, { name: input.name, teamId: input.teamId }, request.ip);
+    return reply.code(201).send({ id: project.id });
+  });
+
+  app.get("/api/projects/:projectId/runs", async (request) => {
+    const principal = await requirePrincipal(request);
+    const { projectId } = z.object({ projectId: idSchema }).parse(request.params);
+    await getAccessibleProject(principal, projectId);
+    const result = await query(
+      `SELECT r.id, r.phase, r.prompt, r.status, r.model, r.total_tokens AS "totalTokens",
+              r.estimated_cost_usd::float8 AS "estimatedCostUsd", r.created_at AS "createdAt",
+              coalesce((SELECT json_agg(json_build_object('sequence', e.sequence, 'type', e.type, 'message', e.message, 'metadata', e.metadata, 'createdAt', e.created_at) ORDER BY e.sequence)
+                FROM agent_run_events e WHERE e.run_id = r.id), '[]') AS events,
+              coalesce((SELECT json_agg(json_build_object('path', f.path, 'additions', f.additions, 'deletions', f.deletions, 'summary', f.summary))
+                FROM agent_run_files f WHERE f.run_id = r.id), '[]') AS files
+         FROM agent_runs r WHERE r.project_id = $1 ORDER BY r.created_at DESC LIMIT 30`,
+      [projectId]
+    );
+    return { runs: result.rows };
+  });
+
+  app.post("/api/projects/:projectId/runs", async (request, reply) => {
+    const principal = await requirePrincipal(request);
+    requirePermission(principal, "agent:run");
+    const { projectId } = z.object({ projectId: idSchema }).parse(request.params);
+    const input = z.object({ prompt: z.string().trim().min(3).max(50_000), phase: phaseSchema.default("agent:before_edit") }).parse(request.body);
+    const project = await getAccessibleProject(principal, projectId);
+    const result = await query<{ id: string }>(
+      `INSERT INTO agent_runs (organization_id, team_id, project_id, user_id, phase, prompt)
+       VALUES ($1,$2,$3,$4,$5,$6) RETURNING id`,
+      [principal.organizationId, project.teamId, project.id, principal.userId, input.phase, input.prompt]
+    );
+    const run = result.rows[0]!;
+    await query("UPDATE projects SET status = 'building', updated_at = now() WHERE id = $1", [project.id]);
+    await writeAudit(principal, "agent_run.created", "agent_run", run.id, { projectId: project.id, phase: input.phase }, request.ip);
+    enqueueRun(run.id);
+    return reply.code(202).send({ id: run.id, status: "queued" });
+  });
+
+  app.get("/api/runs/:runId/events", async (request, reply) => {
+    const principal = await requirePrincipal(request);
+    const { runId } = z.object({ runId: idSchema }).parse(request.params);
+    const run = await query<{ project_id: string }>("SELECT project_id FROM agent_runs WHERE id = $1", [runId]);
+    if (!run.rows[0]) return reply.code(404).send({ error: "Run not found" });
+    await getAccessibleProject(principal, run.rows[0].project_id);
+    const existing = await query(
+      `SELECT id, run_id AS "runId", sequence, type, message, metadata, created_at AS "createdAt"
+         FROM agent_run_events WHERE run_id = $1 ORDER BY sequence`,
+      [runId]
+    );
+    reply.hijack();
+    reply.raw.writeHead(200, {
+      "content-type": "text/event-stream",
+      "cache-control": "no-cache, no-transform",
+      connection: "keep-alive",
+      "x-accel-buffering": "no"
+    });
+    for (const event of existing.rows) reply.raw.write(`data: ${JSON.stringify(event)}\n\n`);
+    const unsubscribe = subscribeToRun(runId, (event) => reply.raw.write(`data: ${JSON.stringify(event)}\n\n`));
+    const heartbeat = setInterval(() => reply.raw.write(": heartbeat\n\n"), 15_000);
+    request.raw.on("close", () => { clearInterval(heartbeat); unsubscribe(); });
+  });
+
+  app.get("/api/projects/:projectId/policy", async (request) => {
+    const principal = await requirePrincipal(request);
+    const params = z.object({ projectId: idSchema }).parse(request.params);
+    const queryInput = z.object({ phase: phaseSchema.default("agent:before_edit") }).parse(request.query);
+    const project = await getAccessibleProject(principal, params.projectId);
+    const policy = await resolvePolicy({
+      organizationId: principal.organizationId, teamId: project.teamId, userId: principal.userId,
+      projectId: project.id, phase: queryInput.phase
+    });
+    return { policy: { ...policy, encryptedApiKey: undefined } };
+  });
+
+  registerAdminRoutes(app);
+  registerMetricsRoutes(app);
+  registerDeploymentRoutes(app);
+
+  app.get("/api/projects/:projectId/preview/*", async (request, reply) => {
+    const principal = await requirePrincipal(request);
+    const params = z.object({ projectId: idSchema, "*": z.string().default("") }).parse(request.params);
+    await getAccessibleProject(principal, params.projectId);
+    const path = params["*"] || "index.html";
+    const content = await readPreview(params.projectId, path);
+    return reply.type(mimeType(path)).header("content-security-policy", "default-src 'self'; style-src 'self' 'unsafe-inline'; script-src 'self' 'unsafe-inline'; img-src 'self' data:; connect-src 'self'").send(content);
+  });
+
+  app.setErrorHandler((error, request, reply) => {
+    const statusCode = error instanceof ZodError ? 400 : Number((error as Error & { statusCode?: number }).statusCode ?? 500);
+    if (statusCode >= 500) request.log.error(error);
+    const message = statusCode >= 500 && config.NODE_ENV === "production"
+      ? "Internal server error"
+      : error instanceof Error ? error.message : "Request failed";
+    reply.code(statusCode).send({ error: message, details: error instanceof ZodError ? error.issues : undefined });
+  });
+
+  if (config.NODE_ENV === "production") {
+    const root = join(process.cwd(), "dist");
+    void access(root).then(() => app.register(fastifyStatic, { root, wildcard: false })).catch(() => undefined);
+    app.setNotFoundHandler((request, reply) => {
+      if (request.url.startsWith("/api/") || request.url === "/healthz") return reply.code(404).send({ error: "Not found" });
+      return reply.sendFile("index.html");
+    });
+  }
+  return app;
+}
+
+function registerAdminRoutes(app: FastifyInstance) {
+  app.get("/api/admin/teams", async (request) => {
+    const principal = await requirePrincipal(request); requirePermission(principal, "team:update");
+    const result = await query(
+      `SELECT t.id, t.name, t.slug, count(m.user_id)::int AS "memberCount"
+         FROM teams t LEFT JOIN memberships m ON m.team_id = t.id
+        WHERE t.organization_id = $1 GROUP BY t.id ORDER BY t.name`,
+      [principal.organizationId]
+    );
+    return { teams: result.rows };
+  });
+  app.post("/api/admin/teams", async (request, reply) => {
+    const principal = await requirePrincipal(request); requirePermission(principal, "team:update");
+    const input = z.object({ name: z.string().trim().min(2).max(100) }).parse(request.body);
+    const result = await query<{ id: string }>(
+      "INSERT INTO teams (organization_id, name, slug) VALUES ($1,$2,$3) RETURNING id",
+      [principal.organizationId, input.name, `${slugify(input.name)}-${Date.now().toString(36)}`]
+    );
+    await writeAudit(principal, "team.created", "team", result.rows[0]!.id, { name: input.name }, request.ip);
+    return reply.code(201).send({ id: result.rows[0]!.id });
+  });
+  app.get("/api/admin/users", async (request) => {
+    const principal = await requirePrincipal(request); requirePermission(principal, "org:manage");
+    const result = await query(
+      `SELECT u.id, u.email, u.name, om.role,
+              coalesce(json_agg(json_build_object('id', t.id, 'name', t.name, 'role', tm.role)) FILTER (WHERE t.id IS NOT NULL), '[]') AS teams
+         FROM users u JOIN memberships om ON om.user_id=u.id AND om.team_id IS NULL
+         LEFT JOIN memberships tm ON tm.user_id=u.id AND tm.team_id IS NOT NULL LEFT JOIN teams t ON t.id=tm.team_id
+        WHERE om.organization_id=$1 GROUP BY u.id, om.role ORDER BY u.name`,
+      [principal.organizationId]
+    );
+    return { users: result.rows };
+  });
+  app.post("/api/admin/users", async (request, reply) => {
+    const principal = await requirePrincipal(request); requirePermission(principal, "org:manage");
+    const input = z.object({ name: z.string().trim().min(2).max(100), email: z.string().email().max(254), password: z.string().min(12).max(200), role: z.enum(["admin", "developer", "reviewer", "viewer"]), teamId: idSchema.optional() }).parse(request.body);
+    if (input.teamId) await assertScope(principal.organizationId, "team", input.teamId);
+    const passwordHash = await hash(input.password, 12);
+    const userId = await transaction(async (client) => {
+      const user = await client.query<{ id: string }>("INSERT INTO users (email,name,password_hash) VALUES (lower($1),$2,$3) RETURNING id", [input.email, input.name, passwordHash]);
+      const id = user.rows[0]!.id;
+      await client.query("INSERT INTO memberships (organization_id,team_id,user_id,role) VALUES ($1,NULL,$2,$3)", [principal.organizationId, id, input.role]);
+      if (input.teamId) await client.query("INSERT INTO memberships (organization_id,team_id,user_id,role) VALUES ($1,$2,$3,$4)", [principal.organizationId, input.teamId, id, input.role]);
+      return id;
+    });
+    await writeAudit(principal, "user.created", "user", userId, { email: input.email, role: input.role, teamId: input.teamId }, request.ip);
+    return reply.code(201).send({ id: userId });
+  });
+  app.get("/api/admin/providers", async (request) => {
+    const principal = await requirePrincipal(request); requirePermission(principal, "ai_policy:update");
+    const result = await query(
+      `SELECT id, name, base_url AS "baseUrl", default_model AS "defaultModel", allowed_models AS "allowedModels",
+              input_cost_per_million::float8 AS "inputCostPerMillion", output_cost_per_million::float8 AS "outputCostPerMillion",
+              enabled, encrypted_api_key IS NOT NULL AS "hasApiKey" FROM ai_providers WHERE organization_id = $1 ORDER BY name`,
+      [principal.organizationId]
+    );
+    return { providers: result.rows };
+  });
+  app.post("/api/admin/providers", async (request, reply) => {
+    const principal = await requirePrincipal(request); requirePermission(principal, "ai_policy:update");
+    const input = z.object({
+      name: z.string().trim().min(2).max(100), baseUrl: z.string().url(), apiKey: z.string().max(1000).optional(),
+      defaultModel: z.string().min(1).max(200), allowedModels: z.array(z.string().min(1).max(200)).min(1).max(100),
+      inputCostPerMillion: z.number().min(0).max(10000).default(0), outputCostPerMillion: z.number().min(0).max(10000).default(0)
+    }).parse(request.body);
+    const result = await query<{ id: string }>(
+      `INSERT INTO ai_providers (organization_id, name, base_url, encrypted_api_key, default_model, allowed_models, input_cost_per_million, output_cost_per_million)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8) RETURNING id`,
+      [principal.organizationId, input.name, assertSafeProviderUrl(input.baseUrl), input.apiKey ? encryptSecret(input.apiKey) : null,
+        input.defaultModel, JSON.stringify(input.allowedModels), input.inputCostPerMillion, input.outputCostPerMillion]
+    );
+    await writeAudit(principal, "ai_provider.created", "ai_provider", result.rows[0]!.id, { name: input.name, baseUrl: input.baseUrl }, request.ip);
+    return reply.code(201).send({ id: result.rows[0]!.id });
+  });
+  app.get("/api/admin/policies", async (request) => {
+    const principal = await requirePrincipal(request); requirePermission(principal, "ai_policy:update");
+    const result = await query("SELECT * FROM ai_policies WHERE organization_id = $1 ORDER BY scope_type", [principal.organizationId]);
+    return { policies: result.rows };
+  });
+  app.post("/api/admin/policies", async (request, reply) => {
+    const principal = await requirePrincipal(request); requirePermission(principal, "ai_policy:update");
+    const input = policyInput().parse(request.body);
+    await assertScope(principal.organizationId, input.scopeType, input.scopeId);
+    const result = await query<{ id: string }>(
+      `INSERT INTO ai_policies (organization_id, scope_type, scope_id, default_provider_id, default_model,
+        allowed_provider_ids, allowed_models, monthly_token_limit, monthly_cost_limit_usd, allow_user_override, require_approval_for)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)
+       ON CONFLICT (organization_id, scope_type, scope_id) DO UPDATE SET default_provider_id=excluded.default_provider_id,
+        default_model=excluded.default_model, allowed_provider_ids=excluded.allowed_provider_ids, allowed_models=excluded.allowed_models,
+        monthly_token_limit=excluded.monthly_token_limit, monthly_cost_limit_usd=excluded.monthly_cost_limit_usd,
+        allow_user_override=excluded.allow_user_override, require_approval_for=excluded.require_approval_for, updated_at=now()
+       RETURNING id`,
+      [principal.organizationId, input.scopeType, input.scopeId, input.defaultProviderId, input.defaultModel,
+        JSON.stringify(input.allowedProviderIds), JSON.stringify(input.allowedModels), input.monthlyTokenLimit,
+        input.monthlyCostLimitUsd, input.allowUserOverride, JSON.stringify(input.requireApprovalFor)]
+    );
+    await writeAudit(principal, "ai_policy.upserted", "ai_policy", result.rows[0]!.id, { scopeType: input.scopeType, scopeId: input.scopeId }, request.ip);
+    return reply.code(201).send({ id: result.rows[0]!.id });
+  });
+  app.get("/api/admin/hooks", async (request) => {
+    const principal = await requirePrincipal(request); requirePermission(principal, "ai_policy:update");
+    const result = await query("SELECT * FROM prompt_hooks WHERE organization_id = $1 ORDER BY priority DESC", [principal.organizationId]);
+    return { hooks: result.rows };
+  });
+  app.post("/api/admin/hooks", async (request, reply) => {
+    const principal = await requirePrincipal(request); requirePermission(principal, "ai_policy:update");
+    const input = z.object({ scopeType: scopeSchema, scopeId: idSchema, phase: phaseSchema, priority: z.number().int().min(-1000).max(1000).default(0), mandatory: z.boolean().default(false), title: z.string().min(2).max(200), prompt: z.string().min(2).max(20_000) }).parse(request.body);
+    await assertScope(principal.organizationId, input.scopeType, input.scopeId);
+    const result = await query<{ id: string }>(
+      `INSERT INTO prompt_hooks (organization_id, scope_type, scope_id, phase, priority, mandatory, title, prompt)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8) RETURNING id`,
+      [principal.organizationId, input.scopeType, input.scopeId, input.phase, input.priority, input.mandatory, input.title, input.prompt]
+    );
+    await writeAudit(principal, "prompt_hook.created", "prompt_hook", result.rows[0]!.id, { scopeType: input.scopeType, scopeId: input.scopeId, phase: input.phase }, request.ip);
+    return reply.code(201).send({ id: result.rows[0]!.id });
+  });
+  app.get("/api/admin/audit", async (request) => {
+    const principal = await requirePrincipal(request); requirePermission(principal, "audit:read");
+    const result = await query("SELECT * FROM audit_events WHERE organization_id = $1 ORDER BY created_at DESC LIMIT 200", [principal.organizationId]);
+    return { events: result.rows };
+  });
+}
+
+function registerMetricsRoutes(app: FastifyInstance) {
+  app.get("/api/metrics/usage", async (request) => {
+    const principal = await requirePrincipal(request);
+    const input = z.object({ scope: z.enum(["global", "team", "user", "project"]).default("user"), id: idSchema.optional(), days: z.coerce.number().int().min(1).max(365).default(30) }).parse(request.query);
+    const permission: Permission = input.scope === "global" ? "metrics:read_global" : input.scope === "team" ? "metrics:read_team" : "metrics:read_user";
+    requirePermission(principal, permission);
+    const scopeId = input.scope === "global" ? principal.organizationId : input.id ?? principal.userId;
+    if (input.scope === "user" && !["owner", "admin"].includes(principal.role) && scopeId !== principal.userId) throw Object.assign(new Error("User metrics access denied"), { statusCode: 403 });
+    const column = { global: "organization_id", team: "team_id", user: "user_id", project: "project_id" }[input.scope];
+    const result = await query(
+      `SELECT date_trunc('day', completed_at) AS day, model, sum(input_tokens)::int AS "inputTokens",
+              sum(output_tokens)::int AS "outputTokens", sum(total_tokens)::int AS "totalTokens",
+              sum(estimated_cost_usd)::float8 AS "estimatedCostUsd", count(*)::int AS requests
+         FROM token_usage_events WHERE organization_id = $1 AND ${column} = $2 AND completed_at >= now() - ($3 || ' days')::interval
+        GROUP BY 1, model ORDER BY 1`,
+      [principal.organizationId, scopeId, input.days]
+    );
+    return { scope: input.scope, scopeId, usage: result.rows };
+  });
+}
+
+function registerDeploymentRoutes(app: FastifyInstance) {
+  app.get("/api/projects/:projectId/deployments", async (request) => {
+    const principal = await requirePrincipal(request); const { projectId } = z.object({ projectId: idSchema }).parse(request.params);
+    await getAccessibleProject(principal, projectId);
+    const result = await query("SELECT * FROM deployments WHERE project_id = $1 ORDER BY created_at DESC", [projectId]);
+    return { deployments: result.rows };
+  });
+  app.post("/api/projects/:projectId/deployments", async (request, reply) => {
+    const principal = await requirePrincipal(request); requirePermission(principal, "deployment:create");
+    const { projectId } = z.object({ projectId: idSchema }).parse(request.params); const project = await getAccessibleProject(principal, projectId);
+    const input = z.object({ environment: z.enum(["staging", "production"]) }).parse(request.body);
+    const status = input.environment === "production" ? "waiting_approval" : "approved";
+    const result = await query<{ id: string }>(
+      `INSERT INTO deployments (organization_id, project_id, requested_by, environment, status) VALUES ($1,$2,$3,$4,$5) RETURNING id`,
+      [principal.organizationId, project.id, principal.userId, input.environment, status]
+    );
+    await writeAudit(principal, "deployment.created", "deployment", result.rows[0]!.id, { projectId: project.id, environment: input.environment }, request.ip);
+    return reply.code(201).send({ id: result.rows[0]!.id, status });
+  });
+  app.post("/api/deployments/:deploymentId/approve", async (request) => {
+    const principal = await requirePrincipal(request); requirePermission(principal, "deployment:approve");
+    const { deploymentId } = z.object({ deploymentId: idSchema }).parse(request.params);
+    const result = await query<{ id: string }>(
+      `UPDATE deployments SET status='approved', approved_by=$2, updated_at=now()
+        WHERE id=$1 AND organization_id=$3 AND status='waiting_approval' RETURNING id`,
+      [deploymentId, principal.userId, principal.organizationId]
+    );
+    if (!result.rows[0]) throw Object.assign(new Error("Deployment is not awaiting approval"), { statusCode: 409 });
+    await writeAudit(principal, "deployment.approved", "deployment", deploymentId, {}, request.ip);
+    return { ok: true };
+  });
+}
+
+function policyInput() {
+  return z.object({
+    scopeType: scopeSchema, scopeId: idSchema, defaultProviderId: idSchema, defaultModel: z.string().min(1).max(200),
+    allowedProviderIds: z.array(idSchema).min(1), allowedModels: z.array(z.string().min(1).max(200)).min(1),
+    monthlyTokenLimit: z.number().int().positive(), monthlyCostLimitUsd: z.number().min(0),
+    allowUserOverride: z.boolean().default(false), requireApprovalFor: z.array(phaseSchema).default([])
+  });
+}
+
+async function assertScope(organizationId: string, scopeType: ScopeType, scopeId: string) {
+  if (scopeType === "global" && scopeId === organizationId) return;
+  if (scopeType === "global") throw Object.assign(new Error("Global scope must use the organization id"), { statusCode: 400 });
+  const table = { team: "teams", user: "users", project: "projects" }[scopeType];
+  if (!table) throw Object.assign(new Error("Invalid scope"), { statusCode: 400 });
+  const organizationColumn = table === "users" ? null : "organization_id";
+  const result = organizationColumn
+    ? await query(`SELECT 1 FROM ${table} WHERE id=$1 AND ${organizationColumn}=$2`, [scopeId, organizationId])
+    : await query("SELECT 1 FROM memberships WHERE user_id=$1 AND organization_id=$2", [scopeId, organizationId]);
+  if (!result.rowCount) throw Object.assign(new Error("Scope does not belong to this organization"), { statusCode: 400 });
+}
+
+function slugify(value: string) {
+  return value.toLowerCase().normalize("NFKD").replace(/[^a-z0-9]+/g, "-").replace(/^-|-$/g, "").slice(0, 60) || "workspace";
+}
+
+function mimeType(path: string) {
+  return ({ ".html": "text/html; charset=utf-8", ".css": "text/css; charset=utf-8", ".js": "text/javascript; charset=utf-8", ".json": "application/json", ".svg": "image/svg+xml", ".png": "image/png", ".jpg": "image/jpeg" } as Record<string, string>)[extname(path).toLowerCase()] ?? "application/octet-stream";
+}
+
+export async function closeApp() {
+  await pool.end();
+}

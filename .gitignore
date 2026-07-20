@@ -1,0 +1,10 @@
+node_modules
+dist
+dist-server
+.vibeable
+coverage
+.DS_Store
+.env
+.env.local
+npm-debug.log*
+*.tsbuildinfo
