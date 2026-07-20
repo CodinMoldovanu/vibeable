@@ -4,6 +4,27 @@ Vibeable is a source-available, self-hosted, policy-aware AI application builder
 
 This repository is a self-hosted community edition, not a claim of feature-for-feature or security equivalence with Lovable. It is useful today for trusted company teams building web workspaces through an OpenAI-compatible endpoint. Read [Production readiness](docs/production-readiness.md) before allowing untrusted users or enabling command execution.
 
+## Product tour
+
+### Builder and live preview
+
+![Vibeable builder with an agent timeline, generated inventory application preview, and changed files](docs/screenshots/builder.jpg)
+
+### Scoped token usage
+
+![Vibeable global token and cost usage dashboard](docs/screenshots/usage.jpg)
+
+### Teams and AI governance
+
+<table>
+  <tr>
+    <td width="50%"><img src="docs/screenshots/teams.jpg" alt="Vibeable teams, users, and role administration"></td>
+    <td width="50%"><img src="docs/screenshots/governance.jpg" alt="Vibeable OpenAI-compatible providers and scoped AI policies"></td>
+  </tr>
+</table>
+
+Screenshots use local demo records and contain no production credentials.
+
 ## What works
 
 - First-run organization and owner bootstrap, password login, opaque server-side sessions.
