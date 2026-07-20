@@ -169,6 +169,7 @@ describe("PostgreSQL API integration", () => {
     expect(preview.statusCode).toBe(200);
     expect(preview.headers["cache-control"]).toBe("private, no-store");
     expect(preview.body).toContain("Integrated");
+    expect(preview.body).toContain("vibeable-preview");
     const projectUsage = (await authenticated("GET", `/api/metrics/usage?scope=project&id=${defaultProjectId}`, developerCookie)).json().usage;
     expect(projectUsage).toEqual([expect.objectContaining({ model: "test/model", totalTokens: 20, requests: 1 })]);
 
@@ -182,10 +183,65 @@ describe("PostgreSQL API integration", () => {
     expect(otherDeployment.statusCode).toBe(201);
     expect((await authenticated("POST", `/api/deployments/${otherDeployment.json().id}/approve`, reviewerCookie)).statusCode).toBe(404);
   }, 20_000);
+
+  it("edits providers without exposing or clearing stored API keys", async () => {
+    const created = await authenticated("POST", "/api/admin/providers", ownerCookie, {
+      name: "Editable provider", baseUrl: "https://example.test/v1", apiKey: "provider-secret-value",
+      defaultModel: "example/model", allowedModels: ["example/model"], inputCostPerMillion: 1, outputCostPerMillion: 2
+    });
+    expect(created.statusCode).toBe(201);
+    const providerId = created.json().id as string;
+    const updated = await authenticated("PATCH", `/api/admin/providers/${providerId}`, ownerCookie, {
+      name: "Edited provider", baseUrl: "https://example.test/api/v1", defaultModel: "example/model",
+      allowedModels: ["example/model"], inputCostPerMillion: 1.5, outputCostPerMillion: 2.5, enabled: true
+    });
+    expect(updated.statusCode).toBe(200);
+    const providers = (await authenticated("GET", "/api/admin/providers", ownerCookie)).json().providers as Array<Record<string, unknown>>;
+    expect(providers.find((provider) => provider.id === providerId)).toEqual(expect.objectContaining({
+      name: "Edited provider", hasApiKey: true, baseUrl: "https://example.test/api/v1"
+    }));
+    expect(JSON.stringify(providers)).not.toContain("provider-secret-value");
+  });
+
+  it("manages project capabilities and redacts secrets from runtime logs", async () => {
+    const resource = await authenticated("POST", `/api/projects/${defaultProjectId}/resources`, ownerCookie, {
+      kind: "api", name: "PAYMENTS_API_KEY", environment: "development", value: "top-secret-payment-token", config: { url: "https://payments.example.test/v1" }
+    });
+    expect(resource.statusCode).toBe(201);
+    const configuredPreview = await authenticated("GET", `/api/projects/${defaultProjectId}/preview/index.html`, ownerCookie);
+    expect(configuredPreview.headers["content-security-policy"]).toContain("https://payments.example.test");
+    expect(configuredPreview.headers["content-security-policy"]).toContain("frame-ancestors 'self'");
+    const log = await authenticated("POST", `/api/projects/${defaultProjectId}/logs`, ownerCookie, {
+      level: "error", message: "Request failed with top-secret-payment-token"
+    });
+    expect(log.statusCode).toBe(202);
+    const logs = (await authenticated("GET", `/api/projects/${defaultProjectId}/logs`, ownerCookie)).json().logs as Array<{ message: string }>;
+    expect(logs[0]?.message).toBe("Request failed with [redacted]");
+    const resources = (await authenticated("GET", `/api/projects/${defaultProjectId}/resources`, ownerCookie)).json().resources;
+    expect(resources).toEqual(expect.arrayContaining([expect.objectContaining({ name: "PAYMENTS_API_KEY", configured: true })]));
+    expect(JSON.stringify(resources)).not.toContain("top-secret-payment-token");
+
+    const firstDatabase = await authenticated("POST", `/api/projects/${defaultProjectId}/resources/database`, ownerCookie);
+    const secondDatabase = await authenticated("POST", `/api/projects/${defaultProjectId}/resources/database`, ownerCookie);
+    expect(firstDatabase.statusCode).toBe(201);
+    expect(secondDatabase.json().id).toBe(firstDatabase.json().id);
+    const withDatabase = (await authenticated("GET", `/api/projects/${defaultProjectId}/resources`, ownerCookie)).json().resources as Array<{ id: string; kind: string; config: { role?: string } }>;
+    const databaseResource = withDatabase.find((item) => item.id === firstDatabase.json().id)!;
+    expect(databaseResource.config.role).toMatch(/^vibeable_app_/);
+
+    const unsafeGit = await authenticated("POST", `/api/projects/${defaultProjectId}/resources`, ownerCookie, {
+      kind: "git", name: "SOURCE_REPOSITORY", environment: "development", config: { repositoryUrl: "https://token@example.test/repo.git" }
+    });
+    expect(unsafeGit.statusCode).toBe(400);
+    expect((await authenticated("DELETE", `/api/projects/${defaultProjectId}/resources/${databaseResource.id}`, ownerCookie)).statusCode).toBe(200);
+    const removedRole = await databasePool.query("SELECT 1 FROM pg_roles WHERE rolname=$1", [databaseResource.config.role]);
+    expect(removedRole.rowCount).toBe(0);
+    expect((await authenticated("DELETE", `/api/projects/${defaultProjectId}/resources/${resource.json().id}`, ownerCookie)).statusCode).toBe(200);
+  });
 });
 
-async function authenticated(method: "GET" | "POST", url: string, cookie: string, payload?: Record<string, unknown>) {
-  return app.inject({ method, url, headers: { cookie, ...(method === "POST" ? csrf : {}) }, payload });
+async function authenticated(method: "GET" | "POST" | "PATCH" | "DELETE", url: string, cookie: string, payload?: Record<string, unknown>) {
+  return app.inject({ method, url, headers: { cookie, ...(!["GET", "HEAD"].includes(method) ? csrf : {}) }, payload });
 }
 
 async function login(email: string, password: string) {

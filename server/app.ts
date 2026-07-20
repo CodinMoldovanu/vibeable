@@ -9,6 +9,7 @@ import Fastify, { type FastifyInstance } from "fastify";
 import { z, ZodError } from "zod";
 import type { AgentPhase, Permission, Role, ScopeType } from "../src/domain/types.js";
 import { can } from "../src/domain/rbac.js";
+import { inferAgentPhase } from "../src/domain/intent.js";
 import { authenticate, createSession, destroySession, getPrincipal, requirePrincipal } from "./auth.js";
 import { config } from "./config.js";
 import { pool, query, transaction } from "./db.js";
@@ -17,6 +18,10 @@ import { enqueueRun, recordRunEvent } from "./orchestrator.js";
 import { requirePermission } from "./permissions.js";
 import { resolvePolicy } from "./policy.js";
 import { assertSafeProviderUrl, encryptSecret } from "./security.js";
+import {
+  deleteProjectResource, listProjectResources, projectPreviewOrigins, provisionProjectDatabase, recordProjectLog,
+  upsertProjectResource, type ResourceKind
+} from "./resources.js";
 import { getAccessibleProject, listMemberTeamIds, writeAudit } from "./store.js";
 import { ensureWorkspace, readPreview } from "./workspace.js";
 
@@ -28,6 +33,12 @@ const phaseSchema = z.enum([
   "generate_commit_message", "database_migration", "production_deploy_prepare"
 ]);
 const scopeSchema = z.enum(["global", "team", "user", "project"]);
+const resourceConfigSchema = z.record(
+  z.string().trim().min(1).max(64),
+  z.union([z.string().trim().max(2000), z.number().finite(), z.boolean()])
+).superRefine((value, context) => {
+  if (Object.keys(value).length > 20) context.addIssue({ code: "custom", message: "Resource metadata is limited to 20 fields" });
+});
 
 export function buildApp() {
   const app = Fastify({
@@ -200,9 +211,11 @@ export function buildApp() {
     const { projectId } = z.object({ projectId: idSchema }).parse(request.params);
     await getAccessibleProject(principal, projectId);
     const result = await query(
-      `SELECT r.id, r.phase, r.prompt, r.status, r.model, r.commit_sha AS "commitSha", r.total_tokens AS "totalTokens",
+      `SELECT r.id, r.phase, r.prompt, r.status, r.model, r.provider_id AS "providerId",
+              r.progress, r.stage_message AS "stageMessage", r.repair_attempts AS "repairAttempts",
+              r.commit_sha AS "commitSha", r.total_tokens AS "totalTokens",
               r.user_id AS "userId",
-              r.estimated_cost_usd::float8 AS "estimatedCostUsd", r.created_at AS "createdAt",
+              r.estimated_cost_usd::float8 AS "estimatedCostUsd", r.created_at AS "createdAt", r.finished_at AS "finishedAt",
               coalesce((SELECT json_agg(json_build_object('sequence', e.sequence, 'type', e.type, 'message', e.message, 'metadata', e.metadata, 'createdAt', e.created_at) ORDER BY e.sequence)
                 FROM agent_run_events e WHERE e.run_id = r.id), '[]') AS events,
               coalesce((SELECT json_agg(json_build_object('path', f.path, 'additions', f.additions, 'deletions', f.deletions, 'summary', f.summary))
@@ -217,31 +230,56 @@ export function buildApp() {
     const principal = await requirePrincipal(request);
     requirePermission(principal, "agent:run");
     const { projectId } = z.object({ projectId: idSchema }).parse(request.params);
-    const input = z.object({ prompt: z.string().trim().min(3).max(50_000), phase: phaseSchema.default("agent:before_edit") }).parse(request.body);
+    const input = z.object({
+      prompt: z.string().trim().min(3).max(50_000),
+      providerId: idSchema.optional(),
+      model: z.string().trim().min(1).max(200).optional(),
+      phase: phaseSchema.optional()
+    }).parse(request.body);
     const project = await getAccessibleProject(principal, projectId);
+    const completed = await query("SELECT 1 FROM agent_runs WHERE project_id=$1 AND status='ready' LIMIT 1", [project.id]);
+    const phase = input.phase ?? inferAgentPhase(input.prompt, Boolean(completed.rowCount));
     const policy = await resolvePolicy({
       organizationId: principal.organizationId,
       teamId: project.teamId,
       userId: principal.userId,
       projectId: project.id,
-      phase: input.phase
+      phase,
+      providerId: input.providerId,
+      model: input.model
     });
     const status = policy.requireApproval ? "waiting_approval" : "queued";
     const result = await query<{ id: string }>(
       `INSERT INTO agent_runs (organization_id, team_id, project_id, user_id, phase, prompt, status, provider_id, model)
        VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9) RETURNING id`,
-      [principal.organizationId, project.teamId, project.id, principal.userId, input.phase, input.prompt,
+      [principal.organizationId, project.teamId, project.id, principal.userId, phase, input.prompt,
         status, policy.provider.id, policy.model]
     );
     const run = result.rows[0]!;
     await query("UPDATE projects SET status = 'building', updated_at = now() WHERE id = $1", [project.id]);
-    await writeAudit(principal, "agent_run.created", "agent_run", run.id, { projectId: project.id, phase: input.phase, status }, request.ip);
+    await writeAudit(principal, "agent_run.created", "agent_run", run.id, {
+      projectId: project.id, phase, providerId: policy.provider.id, model: policy.model, status
+    }, request.ip);
     if (status === "waiting_approval") {
       await recordRunEvent(run.id, "approval", "Run is waiting for an authorized approver");
     } else {
       enqueueRun(run.id);
     }
     return reply.code(202).send({ id: run.id, status });
+  });
+
+  app.get("/api/projects/:projectId/provider-options", async (request) => {
+    const principal = await requirePrincipal(request);
+    const { projectId } = z.object({ projectId: idSchema }).parse(request.params);
+    const project = await getAccessibleProject(principal, projectId);
+    const policy = await resolvePolicy({
+      organizationId: principal.organizationId, teamId: project.teamId, userId: principal.userId,
+      projectId: project.id, phase: "agent:before_edit"
+    });
+    return {
+      selected: { providerId: policy.provider.id, model: policy.model },
+      providers: policy.providerOptions
+    };
   });
 
   app.post("/api/runs/:runId/approve", async (request, reply) => {
@@ -303,6 +341,7 @@ export function buildApp() {
   registerAdminRoutes(app);
   registerMetricsRoutes(app);
   registerDeploymentRoutes(app);
+  registerProjectResourceRoutes(app);
 
   app.get("/api/projects/:projectId/preview/*", async (request, reply) => {
     const principal = await requirePrincipal(request);
@@ -310,10 +349,14 @@ export function buildApp() {
     await getAccessibleProject(principal, params.projectId);
     const path = params["*"] || "index.html";
     const content = await readPreview(params.projectId, path);
+    const previewOrigins = await projectPreviewOrigins(principal.organizationId, params.projectId);
+    const body = extname(path).toLowerCase() === ".html"
+      ? injectPreviewBridge(content.toString("utf8"), params.projectId)
+      : content;
     return reply.type(mimeType(path))
       .header("cache-control", "private, no-store")
-      .header("content-security-policy", "default-src 'self'; style-src 'self' 'unsafe-inline'; script-src 'self' 'unsafe-inline'; img-src 'self' data:; connect-src 'self'")
-      .send(content);
+      .header("content-security-policy", `default-src 'self'; style-src 'self' 'unsafe-inline'; script-src 'self' 'unsafe-inline'; img-src 'self' data: ${previewOrigins.join(" ")}; connect-src 'self' ${previewOrigins.join(" ")}; object-src 'none'; base-uri 'none'; frame-ancestors 'self'`)
+      .send(body);
   });
 
   app.setErrorHandler((error, request, reply) => {
@@ -402,7 +445,8 @@ function registerAdminRoutes(app: FastifyInstance) {
     const result = await query(
       `SELECT id, name, base_url AS "baseUrl", default_model AS "defaultModel", allowed_models AS "allowedModels",
               input_cost_per_million::float8 AS "inputCostPerMillion", output_cost_per_million::float8 AS "outputCostPerMillion",
-              enabled, encrypted_api_key IS NOT NULL AS "hasApiKey" FROM ai_providers WHERE organization_id = $1 ORDER BY name`,
+              enabled, encrypted_api_key IS NOT NULL AS "hasApiKey", updated_at AS "updatedAt"
+         FROM ai_providers WHERE organization_id = $1 ORDER BY name`,
       [principal.organizationId]
     );
     return { providers: result.rows };
@@ -422,6 +466,30 @@ function registerAdminRoutes(app: FastifyInstance) {
     );
     await writeAudit(principal, "ai_provider.created", "ai_provider", result.rows[0]!.id, { name: input.name, baseUrl: input.baseUrl }, request.ip);
     return reply.code(201).send({ id: result.rows[0]!.id });
+  });
+  app.patch("/api/admin/providers/:providerId", async (request) => {
+    const principal = await requirePrincipal(request); requirePermission(principal, "ai_policy:update");
+    const { providerId } = z.object({ providerId: idSchema }).parse(request.params);
+    const input = z.object({
+      name: z.string().trim().min(2).max(100), baseUrl: z.string().url(), apiKey: z.string().max(1000).optional(),
+      defaultModel: z.string().min(1).max(200), allowedModels: z.array(z.string().min(1).max(200)).min(1).max(100),
+      inputCostPerMillion: z.number().min(0).max(10000), outputCostPerMillion: z.number().min(0).max(10000),
+      enabled: z.boolean()
+    }).parse(request.body);
+    const encryptedApiKey = input.apiKey ? encryptSecret(input.apiKey) : null;
+    const result = await query(
+      `UPDATE ai_providers SET name=$3, base_url=$4,
+         encrypted_api_key=coalesce($5, encrypted_api_key), default_model=$6, allowed_models=$7,
+         input_cost_per_million=$8, output_cost_per_million=$9, enabled=$10, updated_at=now()
+       WHERE id=$1 AND organization_id=$2 RETURNING id`,
+      [providerId, principal.organizationId, input.name, assertSafeProviderUrl(input.baseUrl), encryptedApiKey,
+        input.defaultModel, JSON.stringify(input.allowedModels), input.inputCostPerMillion, input.outputCostPerMillion, input.enabled]
+    );
+    if (!result.rowCount) throw Object.assign(new Error("AI provider not found"), { statusCode: 404 });
+    await writeAudit(principal, "ai_provider.updated", "ai_provider", providerId, {
+      name: input.name, baseUrl: input.baseUrl, enabled: input.enabled, keyRotated: Boolean(input.apiKey)
+    }, request.ip);
+    return { ok: true };
   });
   app.get("/api/admin/policies", async (request) => {
     const principal = await requirePrincipal(request); requirePermission(principal, "ai_policy:update");
@@ -589,6 +657,103 @@ function registerDeploymentRoutes(app: FastifyInstance) {
   });
 }
 
+function registerProjectResourceRoutes(app: FastifyInstance) {
+  app.get("/api/projects/:projectId/resources", async (request) => {
+    const principal = await requirePrincipal(request);
+    const { projectId } = z.object({ projectId: idSchema }).parse(request.params);
+    await getAccessibleProject(principal, projectId);
+    return { resources: await listProjectResources(principal.organizationId, projectId) };
+  });
+
+  app.post("/api/projects/:projectId/resources", async (request, reply) => {
+    const principal = await requirePrincipal(request); requirePermission(principal, "project:update");
+    const { projectId } = z.object({ projectId: idSchema }).parse(request.params);
+    await getAccessibleProject(principal, projectId);
+    const input = z.object({
+      kind: z.enum(["secret", "api", "smtp", "git", "service"]),
+      name: z.string().trim().toUpperCase().regex(/^[A-Z][A-Z0-9_]{1,63}$/),
+      environment: z.enum(["development", "staging", "production", "all"]).default("development"),
+      value: z.string().min(1).max(20_000).optional(),
+      config: resourceConfigSchema.default({})
+    }).parse(request.body);
+    if (input.value || ["secret", "api", "smtp"].includes(input.kind)) requirePermission(principal, "secret:update");
+    if (input.kind === "git") {
+      const repositoryUrl = String(input.config.repositoryUrl ?? "");
+      let url: URL;
+      try { url = new URL(repositoryUrl); }
+      catch { throw Object.assign(new Error("Git resources require a valid repository URL"), { statusCode: 400 }); }
+      if (url.protocol !== "https:" || url.username || url.password) {
+        throw Object.assign(new Error("Git resources require a credential-free HTTPS repository URL"), { statusCode: 400 });
+      }
+    }
+    for (const [key, value] of Object.entries(input.config)) {
+      if (typeof value !== "string" || !/url$/i.test(key)) continue;
+      let url: URL;
+      try { url = new URL(value); }
+      catch { throw Object.assign(new Error(`${key} must be a valid URL`), { statusCode: 400 }); }
+      if (url.username || url.password) throw Object.assign(new Error("Resource URLs cannot contain credentials"), { statusCode: 400 });
+    }
+    const id = await upsertProjectResource({
+      organizationId: principal.organizationId, projectId, userId: principal.userId,
+      kind: input.kind as Exclude<ResourceKind, "database">, name: input.name,
+      environment: input.environment, value: input.value, config: input.config
+    });
+    await writeAudit(principal, "project_resource.upserted", "project_resource", id, {
+      projectId, kind: input.kind, name: input.name, environment: input.environment, valueUpdated: Boolean(input.value)
+    }, request.ip);
+    return reply.code(201).send({ id });
+  });
+
+  app.post("/api/projects/:projectId/resources/database", async (request, reply) => {
+    const principal = await requirePrincipal(request); requirePermission(principal, "secret:update");
+    const { projectId } = z.object({ projectId: idSchema }).parse(request.params);
+    await getAccessibleProject(principal, projectId);
+    const id = await provisionProjectDatabase({ organizationId: principal.organizationId, projectId, userId: principal.userId });
+    await writeAudit(principal, "project_database.provisioned", "project_resource", id, { projectId }, request.ip);
+    return reply.code(201).send({ id });
+  });
+
+  app.delete("/api/projects/:projectId/resources/:resourceId", async (request) => {
+    const principal = await requirePrincipal(request); requirePermission(principal, "secret:update");
+    const { projectId, resourceId } = z.object({ projectId: idSchema, resourceId: idSchema }).parse(request.params);
+    await getAccessibleProject(principal, projectId);
+    if (!await deleteProjectResource(principal.organizationId, projectId, resourceId)) {
+      throw Object.assign(new Error("Project resource not found"), { statusCode: 404 });
+    }
+    await writeAudit(principal, "project_resource.deleted", "project_resource", resourceId, { projectId }, request.ip);
+    return { ok: true };
+  });
+
+  app.get("/api/projects/:projectId/logs", async (request) => {
+    const principal = await requirePrincipal(request);
+    const { projectId } = z.object({ projectId: idSchema }).parse(request.params);
+    await getAccessibleProject(principal, projectId);
+    const result = await query(
+      `SELECT id::text, run_id AS "runId", source, level, message, created_at AS "createdAt"
+         FROM project_runtime_logs WHERE organization_id=$1 AND project_id=$2 ORDER BY created_at DESC LIMIT 200`,
+      [principal.organizationId, projectId]
+    );
+    return { logs: result.rows };
+  });
+
+  app.post("/api/projects/:projectId/logs", async (request, reply) => {
+    const principal = await requirePrincipal(request);
+    const { projectId } = z.object({ projectId: idSchema }).parse(request.params);
+    await getAccessibleProject(principal, projectId);
+    const input = z.object({
+      level: z.enum(["debug", "info", "warn", "error"]),
+      message: z.string().trim().min(1).max(4000)
+    }).parse(request.body);
+    const recent = await query<{ count: string }>(
+      "SELECT count(*)::text AS count FROM project_runtime_logs WHERE project_id=$1 AND source='preview' AND created_at > now() - interval '1 minute'",
+      [projectId]
+    );
+    if (Number(recent.rows[0]?.count ?? 0) >= 120) return reply.code(429).send({ error: "Preview log rate exceeded" });
+    await recordProjectLog({ organizationId: principal.organizationId, projectId, source: "preview", ...input });
+    return reply.code(202).send({ ok: true });
+  });
+}
+
 function policyInput() {
   return z.object({
     scopeType: scopeSchema, scopeId: idSchema, defaultProviderId: idSchema, defaultModel: z.string().min(1).max(200),
@@ -616,6 +781,19 @@ function slugify(value: string) {
 
 function mimeType(path: string) {
   return ({ ".html": "text/html; charset=utf-8", ".css": "text/css; charset=utf-8", ".js": "text/javascript; charset=utf-8", ".json": "application/json", ".svg": "image/svg+xml", ".png": "image/png", ".jpg": "image/jpeg" } as Record<string, string>)[extname(path).toLowerCase()] ?? "application/octet-stream";
+}
+
+export function injectPreviewBridge(html: string, projectId: string) {
+  const bridge = `<script data-vibeable-preview-bridge>(()=>{
+const projectId=${JSON.stringify(projectId)};
+const serialize=(value)=>{try{return typeof value==='string'?value:JSON.stringify(value)}catch{return String(value)}};
+const send=(level,values)=>parent.postMessage({source:'vibeable-preview',projectId,level,message:values.map(serialize).join(' ').slice(0,4000)},'*');
+for(const level of ['debug','info','warn','error']){const original=console[level]?.bind(console);console[level]=(...values)=>{original?.(...values);send(level,values)}}
+addEventListener('error',(event)=>send('error',[event.message,event.filename+':'+event.lineno]));
+addEventListener('unhandledrejection',(event)=>send('error',['Unhandled rejection',event.reason]));
+send('info',['Preview loaded']);
+})()</script>`;
+  return /<\/body\s*>/i.test(html) ? html.replace(/<\/body\s*>/i, `${bridge}</body>`) : `${html}${bridge}`;
 }
 
 export async function closeApp() {

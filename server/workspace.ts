@@ -36,9 +36,18 @@ export async function ensureWorkspace(projectId: string, projectName: string) {
 
 export async function prepareRunBranch(directory: string, runId: string) {
   await initializeRepository(directory);
-  await git(directory, ["checkout", "main"]);
-  await git(directory, ["reset", "--hard", "HEAD"]);
-  await git(directory, ["clean", "-fd"]);
+  const currentBranch = (await git(directory, ["branch", "--show-current"])).stdout.trim();
+  const status = await git(directory, ["status", "--porcelain"]);
+  if (status.stdout.trim()) {
+    await git(directory, ["add", "-A"]);
+    await git(directory, ["commit", "-m", "Checkpoint workspace before agent run"]);
+  }
+  if (currentBranch !== "main") {
+    await git(directory, ["checkout", "main"]);
+    await git(directory, ["merge", "--ff-only", currentBranch]);
+  } else {
+    await git(directory, ["checkout", "main"]);
+  }
   await git(directory, ["checkout", "-B", `agent/${runId}`]);
 }
 
@@ -108,27 +117,34 @@ export async function applyEdits(directory: string, files: Array<{ path: string;
   return changes;
 }
 
-export async function verifyWorkspace(directory: string) {
+export async function verifyWorkspace(directory: string, runtimeEnvironment: Record<string, string> = {}) {
   if (config.EXECUTION_MODE === "disabled") {
     return { ok: true, output: "Execution disabled; file safety checks passed." };
   }
   const packageJson = await readFile(join(directory, "package.json"), "utf8").catch(() => null);
   if (!packageJson) return { ok: true, output: "Static workspace ready." };
   const command = "corepack pnpm install --frozen-lockfile --ignore-scripts && corepack pnpm run build";
-  if (config.EXECUTION_MODE === "docker") {
-    const { stdout, stderr } = await execFileAsync("docker", [
-      "run", "--rm", "--network", "none", "--cpus", "2", "--memory", "1g", "--pids-limit", "256",
-      "--security-opt", "no-new-privileges", "--cap-drop", "ALL", "-v", `${directory}:/workspace`, "-w", "/workspace",
-      "node:22-alpine", "sh", "-lc", command
-    ], { timeout: 300_000, maxBuffer: 2_000_000 });
+  try {
+    if (config.EXECUTION_MODE === "docker") {
+      const inheritedVariables = Object.keys(runtimeEnvironment).flatMap((name) => ["--env", name]);
+      const { stdout, stderr } = await execFileAsync("docker", [
+        "run", "--rm", "--network", "none", "--cpus", "2", "--memory", "1g", "--pids-limit", "256",
+        "--security-opt", "no-new-privileges", "--cap-drop", "ALL", ...inheritedVariables,
+        "-v", `${directory}:/workspace`, "-w", "/workspace", "node:22-alpine", "sh", "-lc", command
+      ], { timeout: 300_000, maxBuffer: 2_000_000, env: { ...process.env, ...runtimeEnvironment } });
+      return { ok: true, output: `${stdout}\n${stderr}`.trim() };
+    }
+    const { stdout, stderr } = await execFileAsync("sh", ["-lc", command], {
+      cwd: directory,
+      timeout: 300_000,
+      maxBuffer: 2_000_000,
+      env: { ...process.env, ...runtimeEnvironment }
+    });
     return { ok: true, output: `${stdout}\n${stderr}`.trim() };
+  } catch (error) {
+    const failure = error as Error & { stdout?: string; stderr?: string };
+    return { ok: false, output: [failure.message, failure.stdout, failure.stderr].filter(Boolean).join("\n").slice(0, 20_000) };
   }
-  const { stdout, stderr } = await execFileAsync("sh", ["-lc", command], {
-    cwd: directory,
-    timeout: 300_000,
-    maxBuffer: 2_000_000
-  });
-  return { ok: true, output: `${stdout}\n${stderr}`.trim() };
 }
 
 export async function readPreview(projectId: string, requestedPath = "index.html") {
@@ -156,7 +172,7 @@ async function walk(directory: string): Promise<string[]> {
   const entries = await readdir(directory, { withFileTypes: true });
   const result: string[] = [];
   for (const entry of entries) {
-    if (ignored.has(entry.name) || sensitiveNames.test(entry.name)) continue;
+    if (entry.name.startsWith(".") || ignored.has(entry.name) || sensitiveNames.test(entry.name)) continue;
     const path = join(directory, entry.name);
     if (entry.isSymbolicLink()) continue;
     if (entry.isDirectory()) result.push(...await walk(path));
@@ -185,7 +201,7 @@ function isContained(root: string, candidate: string) {
 
 function isSafeGeneratedPath(segments: string[]) {
   return segments.every((segment) => segment && segment !== "." && segment !== ".." &&
-    !repositoryMetadata.has(segment.toLowerCase()) && !sensitiveNames.test(segment));
+    !segment.startsWith(".") && !repositoryMetadata.has(segment.toLowerCase()) && !sensitiveNames.test(segment));
 }
 
 function isPublicPreviewPath(segments: string[]) {

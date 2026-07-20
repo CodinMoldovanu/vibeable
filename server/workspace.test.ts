@@ -40,6 +40,8 @@ describe("workspace boundaries", () => {
       .rejects.toThrow("Unsafe generated path");
     await expect(applyEdits(workspace, [{ path: ".envrc", content: "TOKEN=leaked\n", summary: "Secret" }]))
       .rejects.toThrow("Unsafe generated path");
+    await expect(applyEdits(workspace, [{ path: ".npmrc", content: "//registry/:_authToken=leaked\n", summary: "Config" }]))
+      .rejects.toThrow("Unsafe generated path");
   });
 
   it.skipIf(process.platform === "win32")("disables Git hooks even if another local actor plants one", async () => {
@@ -56,6 +58,17 @@ describe("workspace boundaries", () => {
     await applyEdits(workspace, [{ path: "index.html", content: "after\n", summary: "Update" }]);
     await commitRun(workspace, { runId, userId: "user", providerId: "provider", model: "model", totalTokens: 1 });
     await expect(readFile(marker, "utf8")).rejects.toMatchObject({ code: "ENOENT" });
+  });
+
+  it("checkpoints existing workspace changes before starting the next run", async () => {
+    const workspace = await temporaryDirectory("vibeable-workspace-");
+    await writeFile(join(workspace, "index.html"), "first version\n");
+    await prepareRunBranch(workspace, "11111111-1111-4111-8111-111111111111");
+    await writeFile(join(workspace, "index.html"), "preserved version\n");
+    await writeFile(join(workspace, "extra.css"), "body {}\n");
+    await prepareRunBranch(workspace, "22222222-2222-4222-8222-222222222222");
+    await expect(readFile(join(workspace, "index.html"), "utf8")).resolves.toBe("preserved version\n");
+    await expect(readFile(join(workspace, "extra.css"), "utf8")).resolves.toBe("body {}\n");
   });
 
   it("rejects preview reads through symlinks and traversal", async () => {

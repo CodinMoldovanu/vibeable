@@ -306,6 +306,110 @@ button {
   padding: 12px 14px;
 }
 
+.providerControls {
+  display: grid;
+  grid-template-columns: minmax(0, 0.8fr) minmax(0, 1.2fr);
+  gap: 8px;
+}
+
+.runProgress {
+  display: grid;
+  gap: 9px;
+  padding: 12px 14px;
+  background: #f5f9f8;
+  border-bottom: 1px solid #dce6e4;
+}
+
+.runProgressHeading,
+.stageRail {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+}
+
+.runProgressHeading span {
+  display: inline-flex;
+  align-items: center;
+  min-width: 0;
+  gap: 7px;
+  overflow: hidden;
+  color: #30434a;
+  font-size: 12px;
+  font-weight: 720;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.runProgressHeading strong {
+  color: #17645f;
+  font-size: 12px;
+  white-space: nowrap;
+}
+
+.runProgress progress {
+  width: 100%;
+  height: 7px;
+  overflow: hidden;
+  appearance: none;
+  border: 0;
+  border-radius: 999px;
+}
+
+.runProgress progress::-webkit-progress-bar { background: #dce6e5; }
+.runProgress progress::-webkit-progress-value { background: #1f6f68; transition: width 350ms ease; }
+
+.stageRail span {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  color: #849097;
+  font-size: 10px;
+  text-transform: capitalize;
+}
+
+.stageRail i {
+  width: 7px;
+  height: 7px;
+  background: #c8d2d6;
+  border-radius: 50%;
+}
+
+.stageRail span.active { color: #145b56; font-weight: 800; }
+.stageRail span.active i,
+.stageRail span.complete i { background: #23736c; }
+.stageRail span.failed i { background: #b44151; }
+
+.eventTimeline {
+  display: grid;
+  gap: 0;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.eventTimeline li {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  gap: 8px;
+  padding: 8px 0;
+  color: #53636c;
+  border-bottom: 1px solid #edf1f3;
+  font-size: 12px;
+}
+
+.eventTimeline time { color: #8a969c; font-size: 10px; }
+.eventTimeline .error,
+.eventTimeline .verification_failed { color: #9a3340; }
+.eventTimeline .verification_passed,
+.eventTimeline .complete { color: #17645f; }
+
+.spin { animation: spin 900ms linear infinite; }
+.pulse { animation: pulse 1.5s ease-in-out infinite; }
+
+@keyframes spin { to { transform: rotate(360deg); } }
+@keyframes pulse { 50% { opacity: 0.35; } }
+
 .fieldLabel {
   color: #5f6f79;
   font-size: 12px;
@@ -616,7 +720,7 @@ button {
 
 .tabbar {
   display: grid;
-  grid-template-columns: repeat(4, minmax(0, 1fr));
+  grid-template-columns: repeat(5, minmax(0, 1fr));
   gap: 4px;
   padding: 8px;
   border-bottom: 1px solid #e0e7eb;
@@ -673,10 +777,60 @@ button {
 .fileList,
 .hookList,
 .checkList,
-.usageGroup {
+.usageGroup,
+.logList,
+.resourceList {
   display: grid;
   gap: 9px;
 }
+
+.logItem {
+  display: grid;
+  gap: 6px;
+  padding: 10px;
+  background: #11191e;
+  border-left: 3px solid #68777e;
+  border-radius: 4px;
+}
+
+.logItem.warn { border-color: #d99e39; }
+.logItem.error { border-color: #d45562; }
+.logItem.info { border-color: #3c9188; }
+.logItem div { display: flex; justify-content: space-between; gap: 8px; }
+.logItem span,
+.logItem time { color: #9cb0b7; font-size: 10px; text-transform: uppercase; }
+.logItem p { margin: 0; overflow-wrap: anywhere; color: #e5edef; font: 11px/1.5 ui-monospace, SFMono-Regular, Menlo, monospace; white-space: pre-wrap; }
+
+.resourceItem {
+  display: grid;
+  grid-template-columns: 32px minmax(0, 1fr) 30px;
+  align-items: center;
+  gap: 9px;
+  padding: 10px;
+  background: #f8fafb;
+  border: 1px solid #dbe4e8;
+  border-radius: 8px;
+}
+
+.resourceIcon { display: grid; width: 30px; height: 30px; place-items: center; color: #17645f; background: #dff0ed; border-radius: 7px; }
+.resourceItem strong,
+.resourceItem small { display: block; }
+.resourceItem strong { font-size: 12px; }
+.resourceItem small { margin-top: 3px; color: #6b7880; font-size: 10px; }
+
+.resourceForm {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 9px;
+  padding-top: 12px;
+  border-top: 1px solid #e1e7ea;
+}
+
+.resourceForm label { display: grid; gap: 5px; color: #596870; font-size: 11px; font-weight: 700; }
+.resourceForm input,
+.resourceForm select { width: 100%; min-width: 0; min-height: 36px; padding: 7px 9px; border: 1px solid #cbd6dc; border-radius: 7px; background: #fff; }
+.resourceForm .wideField,
+.resourceForm button { grid-column: 1 / -1; }
 
 .fileItem,
 .hookItem {
@@ -1087,7 +1241,7 @@ button {
 
 .settingsRow {
   display: grid;
-  grid-template-columns: 34px minmax(0, 1fr) auto;
+  grid-template-columns: 34px minmax(0, 1fr) auto auto;
   align-items: center;
   gap: 12px;
   min-height: 58px;

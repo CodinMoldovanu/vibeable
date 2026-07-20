@@ -1,6 +1,6 @@
 # Vibeable
 
-Vibeable is a source-available, self-hosted, policy-aware AI application builder for organizations. It combines a conversational coding workflow and authenticated live preview with teams, RBAC, OpenAI-compatible providers, scoped prompt policies, usage accounting, and deployment approvals.
+Vibeable is a source-available, self-hosted, policy-aware AI application builder for organizations. It combines a conversational coding workflow and authenticated live preview with teams, RBAC, editable OpenAI-compatible providers, scoped prompt policies, managed project resources, usage accounting, and deployment approvals.
 
 This repository is a self-hosted community edition, not a claim of feature-for-feature or security equivalence with Lovable. It is useful today for trusted company teams building web workspaces through an OpenAI-compatible endpoint. Read [Production readiness](docs/production-readiness.md) before allowing untrusted users or enabling command execution.
 
@@ -31,11 +31,15 @@ Screenshots use local demo records and contain no production credentials.
 - Organization and team membership with owner, admin, developer, reviewer, and viewer roles.
 - PostgreSQL-backed projects, runs, policies, hooks, usage, deployments, and audit events.
 - OpenRouter or any compatible `/chat/completions` endpoint with encrypted API keys.
+- Per-run provider and model dropdowns constrained by the effective policy; administrators can edit endpoints, models, prices, keys, and availability.
 - Global, team, user, and project policy inheritance with hard provider/model intersections.
-- Lifecycle prompt hooks and approval flags.
+- Automatic lifecycle intent selection plus scoped prompt hooks and approval flags.
 - Structured AI file edits with path traversal and binary/context limits.
 - Git-backed projects with an agent branch and attributed commit for every successful run.
-- Persisted run timelines streamed over SSE.
+- Persisted progress, elapsed time, per-file events, reconnecting SSE, and polling fallback.
+- Preview console/error capture and build logs fed into the next repair or agent pass as untrusted diagnostic context.
+- Write-only project secrets, API/SMTP/service/Git metadata, and project-isolated managed PostgreSQL credentials.
+- One automatic repair pass when workspace verification fails; every provider attempt is included in token and cost accounting.
 - Authenticated live preview with desktop, tablet, and mobile sizing.
 - Selectable global, team, user, and project token/cost dashboards.
 - Independent approval gates for governed agent runs and production deployment records.
@@ -87,6 +91,8 @@ The web UI runs at `http://127.0.0.1:5173`; the API runs at `http://127.0.0.1:87
 | `DATA_DIR` | `.vibeable` | Project workspace storage |
 
 `local` execution runs generated package scripts on the host and is only for a trusted developer machine. Shared installations should use a separately hardened Docker worker; see the threat model.
+
+Project resource values are injected only into configured build verification today. Static previews never receive secret values. Managed PostgreSQL creates an isolated role and schema, but running a generated backend against it requires the dedicated application worker listed in [Production readiness](docs/production-readiness.md). Git resources currently provide repository metadata to the agent; remote clone/pull/push is not yet executed by the control plane.
 
 ## Development commands
 

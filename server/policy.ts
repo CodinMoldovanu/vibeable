@@ -19,6 +19,8 @@ export async function resolvePolicy(input: {
   userId: string;
   projectId: string;
   phase: AgentPhase;
+  providerId?: string;
+  model?: string;
 }) {
   const [providerResult, policyResult, hookResult] = await Promise.all([
     query<ProviderRow>(
@@ -97,9 +99,32 @@ export async function resolvePolicy(input: {
     providers,
     promptHooks
   });
-  const rawProvider = rawProviders.find((provider) => provider.id === effective.provider.id)!;
+  const selectedProviderId = input.providerId ?? effective.provider.id;
+  if (!effective.allowedProviderIds.includes(selectedProviderId)) {
+    throw Object.assign(new Error("Selected AI provider is not allowed by the effective policy"), { statusCode: 403 });
+  }
+  const rawProvider = rawProviders.find((provider) => provider.id === selectedProviderId);
+  if (!rawProvider) throw Object.assign(new Error("Selected AI provider is unavailable"), { statusCode: 409 });
+  const selectedProvider = providers.find((provider) => provider.id === selectedProviderId)!;
+  const allowedModels = effective.allowedModels.filter((model) => selectedProvider.allowedModels.includes(model));
+  const selectedModel = input.model ?? (selectedProviderId === effective.provider.id ? effective.model : selectedProvider.defaultModel);
+  if (!allowedModels.includes(selectedModel)) {
+    throw Object.assign(new Error("Selected AI model is not allowed by the effective policy and provider"), { statusCode: 403 });
+  }
   return {
     ...effective,
+    provider: selectedProvider,
+    model: selectedModel,
+    allowedModels,
+    providerOptions: providers
+      .filter((provider) => effective.allowedProviderIds.includes(provider.id))
+      .map((provider) => ({
+        id: provider.id,
+        name: provider.name,
+        defaultModel: provider.defaultModel,
+        allowedModels: effective.allowedModels.filter((model) => provider.allowedModels.includes(model))
+      }))
+      .filter((provider) => provider.allowedModels.length > 0),
     boundaries: policies.map((policy) => ({
       scope: policy.scope,
       tokenLimit: policy.monthlyTokenLimit,
