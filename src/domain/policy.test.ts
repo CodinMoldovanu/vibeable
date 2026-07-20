@@ -36,4 +36,23 @@ describe("resolveEffectiveAiPolicy", () => {
   it("fails closed without a global policy", () => {
     expect(() => resolveEffectiveAiPolicy({ orgId: "org", teamId: "team", userId: "user", projectId: "project", phase: "agent:before_edit", policies: [], providers, promptHooks: [] })).toThrow("global AI policy");
   });
+
+  it("honors global user-override controls without dropping user budget limits", () => {
+    const policies: AiPolicy[] = [{ ...globalPolicy, allowUserOverride: false }, {
+      ...globalPolicy,
+      id: "user-policy",
+      scope: "user",
+      scopeId: "user",
+      defaultModel: "model-b",
+      monthlyTokenLimit: 100,
+      monthlyCostLimitUsd: 10
+    }];
+    const result = resolveEffectiveAiPolicy({
+      orgId: "org", teamId: "team", userId: "user", projectId: "project",
+      phase: "agent:before_edit", policies, providers, promptHooks: []
+    });
+    expect(result.model).toBe("model-a");
+    expect(result.monthlyTokenLimit).toBe(100);
+    expect(result.monthlyCostLimitUsd).toBe(10);
+  });
 });

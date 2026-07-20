@@ -58,7 +58,7 @@ export async function getPrincipal(request: FastifyRequest): Promise<Principal |
   );
   const principal = result.rows[0];
   if (!principal) return null;
-  void query("UPDATE sessions SET last_seen_at = now() WHERE token_hash = $1", [hashToken(token)]);
+  void query("UPDATE sessions SET last_seen_at = now() WHERE token_hash = $1", [hashToken(token)]).catch(() => undefined);
   return principal;
 }
 

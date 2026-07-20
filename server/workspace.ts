@@ -7,7 +7,9 @@ import { config } from "./config.js";
 const execFileAsync = promisify(execFile);
 const MAX_CONTEXT_BYTES = 120_000;
 const ignored = new Set([".git", "node_modules", "dist"]);
-const sensitiveNames = /(?:^\.env(?:\.|$)|\.pem$|\.key$|^id_(?:rsa|dsa|ecdsa|ed25519)$|credentials|secrets?)/i;
+const sensitiveNames = /(?:^\.env|\.pem$|\.key$|^id_(?:rsa|dsa|ecdsa|ed25519)$|credentials|secrets?)/i;
+const repositoryMetadata = new Set([".git", ".hg", ".svn"]);
+const nullDevice = process.platform === "win32" ? "NUL" : "/dev/null";
 
 export function projectDirectory(projectId: string) {
   return join(config.DATA_DIR, "projects", projectId);
@@ -85,7 +87,7 @@ export async function applyEdits(directory: string, files: Array<{ path: string;
   for (const file of files) {
     const destination = resolve(root, file.path);
     const segments = relative(root, destination).split(sep);
-    if (!isContained(root, destination) || segments.some((segment) => !segment || segment === "." || segment === "..") || file.path.includes("\0")) {
+    if (!isContained(root, destination) || !isSafeGeneratedPath(segments) || file.path.includes("\0")) {
       throw new Error(`Unsafe generated path: ${file.path}`);
     }
     await ensureSafeParent(root, segments.slice(0, -1));
@@ -136,7 +138,8 @@ export async function readPreview(projectId: string, requestedPath = "index.html
 export async function readContainedFile(directory: string, requestedPath = "index.html") {
   const root = await realpath(directory);
   const destination = resolve(root, requestedPath || "index.html");
-  if (!isContained(root, destination)) {
+  const segments = relative(root, destination).split(sep);
+  if (!isContained(root, destination) || !isPublicPreviewPath(segments)) {
     throw Object.assign(new Error("Invalid preview path"), { statusCode: 400 });
   }
   const target = await lstat(destination).catch((error: NodeJS.ErrnoException) => {
@@ -180,6 +183,17 @@ function isContained(root: string, candidate: string) {
   return candidate.startsWith(`${root}${sep}`);
 }
 
+function isSafeGeneratedPath(segments: string[]) {
+  return segments.every((segment) => segment && segment !== "." && segment !== ".." &&
+    !repositoryMetadata.has(segment.toLowerCase()) && !sensitiveNames.test(segment));
+}
+
+function isPublicPreviewPath(segments: string[]) {
+  return segments.every((segment) => segment && segment !== "." && segment !== ".." &&
+    !repositoryMetadata.has(segment.toLowerCase()) && !sensitiveNames.test(segment) &&
+    (!segment.startsWith(".") || segment === ".well-known"));
+}
+
 async function initializeRepository(directory: string) {
   const repository = await stat(join(directory, ".git")).catch(() => null);
   if (repository?.isDirectory()) return;
@@ -191,7 +205,12 @@ async function initializeRepository(directory: string) {
 }
 
 async function git(directory: string, args: string[]) {
-  return execFileAsync("git", args, { cwd: directory, timeout: 30_000, maxBuffer: 2_000_000 });
+  return execFileAsync("git", ["-c", `core.hooksPath=${nullDevice}`, "-c", "core.fsmonitor=false", ...args], {
+    cwd: directory,
+    timeout: 30_000,
+    maxBuffer: 2_000_000,
+    env: { ...process.env, GIT_CONFIG_NOSYSTEM: "1", GIT_CONFIG_GLOBAL: nullDevice }
+  });
 }
 
 function countChangedLines(left: string, right: string) {

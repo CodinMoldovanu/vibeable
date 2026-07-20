@@ -13,3 +13,11 @@ All notable changes to Vibeable will be documented here. The format follows Keep
 - Deployment approval records, Docker Compose packaging, CI, tests, and security documentation.
 - Dual PolyForm licensing for perpetual internal company use and noncommercial community use.
 - Git-backed run branches and commits, independent run approvals, selectable metric scopes, and PostgreSQL integration tests.
+
+### Security
+
+- Block model writes to repository metadata and secret-like files; disable Git hooks and ambient Git configuration for workspace operations.
+- Prevent authenticated preview routes from serving repository metadata, dotfiles, and secret-like files, and mark preview responses private and non-cacheable.
+- Pin AI provider connections to validated public DNS results, reject redirects and reflected provider credentials, and cover IPv4-mapped IPv6 private ranges.
+- Scope deployment approval to accessible project teams and preserve stricter user budget/approval policy boundaries when user provider overrides are disabled.
+- Refuse insecure non-loopback production `PUBLIC_URL` and cookie configuration at startup.

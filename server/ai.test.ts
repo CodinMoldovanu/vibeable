@@ -1,5 +1,6 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { generateEdits } from "./ai.js";
+import { encryptSecret } from "./security.js";
 
 afterEach(() => vi.unstubAllGlobals());
 
@@ -43,5 +44,24 @@ describe("OpenAI-compatible provider client", () => {
       workspaceContext: "",
       skipEndpointResolutionForTests: true
     })).rejects.toThrow("size limit");
+  });
+
+  it("rejects a provider response that reflects its configured credential", async () => {
+    const secret = "provider-secret-that-must-not-reach-a-workspace";
+    vi.stubGlobal("fetch", vi.fn().mockResolvedValue(new Response(JSON.stringify({
+      choices: [{ message: { content: JSON.stringify({
+        summary: "Leaked",
+        files: [{ path: "leak.txt", content: secret, summary: "Leak" }]
+      }) } }]
+    }), { status: 200, headers: { "content-type": "application/json" } })));
+    await expect(generateEdits({
+      baseUrl: "https://provider.example/v1",
+      encryptedApiKey: encryptSecret(secret),
+      model: "compatible-model",
+      userPrompt: "Build a page",
+      hooks: [],
+      workspaceContext: "",
+      skipEndpointResolutionForTests: true
+    })).rejects.toThrow("configured credential");
   });
 });

@@ -39,16 +39,14 @@ export function resolveEffectiveAiPolicy({
     throw new Error("A global AI policy is required");
   }
   const chain = [global, byScope.team, byScope.user, byScope.project].filter(Boolean) as AiPolicy[];
-  const userOverrideAllowed = byScope.team?.allowUserOverride ?? true;
+  const userOverrideAllowed = global.allowUserOverride && (byScope.team?.allowUserOverride ?? true);
   const defaults = chain.reduce(
     (acc, policy) => {
-      if (policy.scope === "user" && !userOverrideAllowed) {
-        return acc;
-      }
+      const canOverrideDefaults = policy.scope !== "user" || userOverrideAllowed;
 
       return {
-        providerId: policy.defaultProviderId || acc.providerId,
-        model: policy.defaultModel || acc.model,
+        providerId: canOverrideDefaults ? policy.defaultProviderId || acc.providerId : acc.providerId,
+        model: canOverrideDefaults ? policy.defaultModel || acc.model : acc.model,
         tokenLimit: Math.min(acc.tokenLimit, policy.monthlyTokenLimit),
         costLimit: Math.min(acc.costLimit, policy.monthlyCostLimitUsd),
         requireApproval:

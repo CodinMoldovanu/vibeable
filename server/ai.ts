@@ -1,4 +1,6 @@
 import { z } from "zod";
+import type { LookupFunction } from "node:net";
+import { Agent, fetch as pinnedFetch, type Response as UndiciResponse } from "undici";
 import { assertSafeProviderResolution, decryptSecret } from "./security.js";
 
 const editResponseSchema = z.object({
@@ -29,16 +31,28 @@ export async function generateEdits(input: {
 }) {
   const controller = new AbortController();
   const timeout = setTimeout(() => controller.abort(), 180_000);
+  let dispatcher: Agent | undefined;
   try {
-    const baseUrl = input.skipEndpointResolutionForTests ? input.baseUrl.replace(/\/$/, "") : await assertSafeProviderResolution(input.baseUrl);
-    const request = async (jsonMode: boolean) => fetch(`${baseUrl}/chat/completions`, {
+    const endpoint = input.skipEndpointResolutionForTests
+      ? { url: input.baseUrl.replace(/\/$/, "") }
+      : await assertSafeProviderResolution(input.baseUrl);
+    if ("address" in endpoint) {
+      const lookup: LookupFunction = (_hostname, options, callback) => {
+        if (options.all) callback(null, [{ address: endpoint.address, family: endpoint.family }]);
+        else callback(null, endpoint.address, endpoint.family);
+      };
+      dispatcher = new Agent({ connect: { lookup } });
+    }
+    const apiKey = input.encryptedApiKey ? decryptSecret(input.encryptedApiKey) : null;
+    const request = async (jsonMode: boolean) => (input.skipEndpointResolutionForTests ? globalThis.fetch : pinnedFetch)(`${endpoint.url}/chat/completions`, {
         method: "POST",
         redirect: "error",
         signal: controller.signal,
+        ...(dispatcher ? { dispatcher } : {}),
         headers: {
           "content-type": "application/json",
-          ...(input.encryptedApiKey
-            ? { authorization: `Bearer ${decryptSecret(input.encryptedApiKey)}` }
+          ...(apiKey
+            ? { authorization: `Bearer ${apiKey}` }
             : {})
         },
         body: JSON.stringify({
@@ -68,6 +82,7 @@ export async function generateEdits(input: {
       response = await request(false);
       payload = await readProviderResponse(response);
     }
+    if (apiKey && JSON.stringify(payload).includes(apiKey)) throw new Error("AI provider response contained the configured credential");
     if (!response.ok) throw new Error(payload.error?.message ?? `AI provider returned HTTP ${response.status}`);
     const content = payload.choices?.[0]?.message?.content;
     if (!content) throw new Error("AI provider returned no content");
@@ -83,10 +98,11 @@ export async function generateEdits(input: {
     };
   } finally {
     clearTimeout(timeout);
+    if (dispatcher) await dispatcher.close();
   }
 }
 
-async function readProviderResponse(response: Response): Promise<CompletionResponse> {
+async function readProviderResponse(response: Response | UndiciResponse): Promise<CompletionResponse> {
   const declaredLength = Number(response.headers.get("content-length") ?? 0);
   if (declaredLength > MAX_PROVIDER_RESPONSE_BYTES) throw new Error("AI provider response exceeded the size limit");
   if (!response.body) throw new Error("AI provider returned an empty response");

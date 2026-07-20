@@ -25,11 +25,21 @@ if (values.NODE_ENV === "production" && values.MASTER_KEY === "development-only-
   throw new Error("MASTER_KEY must be changed in production");
 }
 
+const publicUrl = new URL(values.PUBLIC_URL);
+const cookieSecure = values.COOKIE_SECURE ? values.COOKIE_SECURE === "true" : values.NODE_ENV === "production";
+const loopbackPublicUrl = ["localhost", "127.0.0.1", "::1"].includes(publicUrl.hostname);
+if (values.NODE_ENV === "production" && publicUrl.protocol !== "https:" && !loopbackPublicUrl) {
+  throw new Error("PUBLIC_URL must use HTTPS in production");
+}
+if (values.NODE_ENV === "production" && !cookieSecure && !loopbackPublicUrl) {
+  throw new Error("COOKIE_SECURE cannot be disabled in production");
+}
+
 export const config = {
   ...values,
   DATA_DIR: resolve(values.DATA_DIR),
   allowPrivateAiEndpoints: values.ALLOW_PRIVATE_AI_ENDPOINTS === "true",
   requireSeparateApprover: values.REQUIRE_SEPARATE_APPROVER === "true",
-  cookieSecure: values.COOKIE_SECURE ? values.COOKIE_SECURE === "true" : values.NODE_ENV === "production",
+  cookieSecure,
   trustProxy: values.TRUST_PROXY === "true"
 };

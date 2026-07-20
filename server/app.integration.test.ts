@@ -167,6 +167,7 @@ describe("PostgreSQL API integration", () => {
     expect(completedRun?.totalTokens).toBe(20);
     const preview = await authenticated("GET", `/api/projects/${defaultProjectId}/preview/index.html`, developerCookie);
     expect(preview.statusCode).toBe(200);
+    expect(preview.headers["cache-control"]).toBe("private, no-store");
     expect(preview.body).toContain("Integrated");
     const projectUsage = (await authenticated("GET", `/api/metrics/usage?scope=project&id=${defaultProjectId}`, developerCookie)).json().usage;
     expect(projectUsage).toEqual([expect.objectContaining({ model: "test/model", totalTokens: 20, requests: 1 })]);
@@ -176,7 +177,11 @@ describe("PostgreSQL API integration", () => {
     expect(deployment.json().status).toBe("waiting_approval");
     expect((await authenticated("POST", `/api/deployments/${deploymentId}/approve`, ownerCookie)).statusCode).toBe(409);
     expect((await authenticated("POST", `/api/deployments/${deploymentId}/approve`, reviewerCookie)).statusCode).toBe(200);
-  });
+
+    const otherDeployment = await authenticated("POST", `/api/projects/${secondProjectId}/deployments`, ownerCookie, { environment: "production" });
+    expect(otherDeployment.statusCode).toBe(201);
+    expect((await authenticated("POST", `/api/deployments/${otherDeployment.json().id}/approve`, reviewerCookie)).statusCode).toBe(404);
+  }, 20_000);
 });
 
 async function authenticated(method: "GET" | "POST", url: string, cookie: string, payload?: Record<string, unknown>) {

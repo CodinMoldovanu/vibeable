@@ -1,5 +1,6 @@
 import type { AgentPhase } from "../src/domain/types.js";
 import { generateEdits } from "./ai.js";
+import { config } from "./config.js";
 import { query, transaction } from "./db.js";
 import { publishRunEvent } from "./events.js";
 import { assertBudget, resolvePolicy } from "./policy.js";
@@ -66,7 +67,8 @@ export async function executeRun(runId: string) {
       model: policy.model,
       userPrompt: run.prompt,
       hooks: policy.hooks.map((hook) => hook.prompt),
-      workspaceContext: context
+      workspaceContext: context,
+      skipEndpointResolutionForTests: config.NODE_ENV === "test"
     });
     const changedFiles = await applyEdits(directory, completion.result.files);
     await recordRunEvent(run.id, "files", `Applied ${changedFiles.length} generated file change(s)`, {

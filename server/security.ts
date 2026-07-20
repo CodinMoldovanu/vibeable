@@ -50,13 +50,19 @@ export function assertSafeProviderUrl(value: string) {
 
 export async function assertSafeProviderResolution(value: string) {
   const normalized = assertSafeProviderUrl(value);
-  if (config.allowPrivateAiEndpoints) return normalized;
   const url = new URL(normalized);
-  const addresses = await lookup(url.hostname, { all: true, verbatim: true });
-  if (!addresses.length || addresses.some((address) => isPrivateHost(address.address))) {
+  let timer: NodeJS.Timeout | undefined;
+  const addresses = await Promise.race([
+    lookup(url.hostname, { all: true, verbatim: true }),
+    new Promise<never>((_resolve, reject) => {
+      timer = setTimeout(() => reject(new Error("AI provider DNS lookup timed out")), 5_000);
+    })
+  ]).finally(() => clearTimeout(timer));
+  if (!addresses.length || (!config.allowPrivateAiEndpoints && addresses.some((address) => isPrivateHost(address.address)))) {
     throw new Error("AI provider hostname resolves to a private or reserved address");
   }
-  return normalized;
+  const selected = [...addresses].sort((left, right) => left.family - right.family)[0]!;
+  return { url: normalized, address: selected.address, family: selected.family };
 }
 
 function isPrivateHost(value: string) {
@@ -73,9 +79,16 @@ function isPrivateHost(value: string) {
       (a === 198 && (b === 18 || b === 19));
   }
   if (family === 6) {
+    if (host.startsWith("::ffff:")) {
+      const suffix = host.slice("::ffff:".length);
+      if (isIP(suffix) === 4) return isPrivateHost(suffix);
+      const [high, low] = suffix.split(":").map((part) => Number.parseInt(part, 16));
+      if (Number.isInteger(high) && Number.isInteger(low)) {
+        return isPrivateHost(`${high! >> 8}.${high! & 0xff}.${low! >> 8}.${low! & 0xff}`);
+      }
+    }
     return host === "::" || host === "::1" || host.startsWith("fc") || host.startsWith("fd") ||
-      /^fe[89ab]/.test(host) || host.startsWith("::ffff:127.") || host.startsWith("::ffff:10.") ||
-      host.startsWith("::ffff:192.168.");
+      host.startsWith("ff") || /^fe[89a-f]/.test(host);
   }
   return false;
 }

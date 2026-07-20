@@ -15,7 +15,7 @@ Vibeable 0.1 is a community preview for trusted internal teams. It is not yet sa
 - Extract orchestration to a durable queue with idempotent workers and run cancellation.
 - Run every generated build and preview in a dedicated container/microVM worker without Docker socket access.
 - Serve previews from a separate origin with short-lived capability tokens.
-- Add outbound DNS/IP pinning and an egress proxy for provider requests.
+- Add an outbound egress proxy or network policy for provider requests. DNS/IP validation and connection pinning are implemented in-process.
 - Add OIDC/SAML, MFA delegation, password reset, email invitations, and session management UI.
 - Add repository import/export, remote push, side-by-side diffs, conflict handling, and explicit accept/reject review. Local branches and attributed commits are implemented.
 - Add an actual deployment adapter and rollback implementation. Current deployment endpoints record approvals only.

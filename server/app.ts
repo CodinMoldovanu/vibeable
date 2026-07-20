@@ -310,7 +310,10 @@ export function buildApp() {
     await getAccessibleProject(principal, params.projectId);
     const path = params["*"] || "index.html";
     const content = await readPreview(params.projectId, path);
-    return reply.type(mimeType(path)).header("content-security-policy", "default-src 'self'; style-src 'self' 'unsafe-inline'; script-src 'self' 'unsafe-inline'; img-src 'self' data:; connect-src 'self'").send(content);
+    return reply.type(mimeType(path))
+      .header("cache-control", "private, no-store")
+      .header("content-security-policy", "default-src 'self'; style-src 'self' 'unsafe-inline'; script-src 'self' 'unsafe-inline'; img-src 'self' data:; connect-src 'self'")
+      .send(content);
   });
 
   app.setErrorHandler((error, request, reply) => {
@@ -568,6 +571,12 @@ function registerDeploymentRoutes(app: FastifyInstance) {
   app.post("/api/deployments/:deploymentId/approve", async (request) => {
     const principal = await requirePrincipal(request); requirePermission(principal, "deployment:approve");
     const { deploymentId } = z.object({ deploymentId: idSchema }).parse(request.params);
+    const existing = await query<{ project_id: string }>(
+      "SELECT project_id FROM deployments WHERE id=$1 AND organization_id=$2",
+      [deploymentId, principal.organizationId]
+    );
+    if (!existing.rows[0]) throw Object.assign(new Error("Deployment not found"), { statusCode: 404 });
+    await getAccessibleProject(principal, existing.rows[0].project_id);
     const result = await query<{ id: string }>(
       `UPDATE deployments SET status='approved', approved_by=$2, updated_at=now()
         WHERE id=$1 AND organization_id=$3 AND status='waiting_approval'

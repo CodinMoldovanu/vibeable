@@ -18,6 +18,11 @@ describe("security helpers", () => {
     expect(() => assertSafeProviderUrl("http://127.0.0.1:8000/v1")).toThrow();
     expect(() => assertSafeProviderUrl("https://100.64.0.1/v1")).toThrow();
     expect(() => assertSafeProviderUrl("https://[fd00::1]/v1")).toThrow();
+    expect(() => assertSafeProviderUrl("https://[fec0::1]/v1")).toThrow();
+    expect(() => assertSafeProviderUrl("https://[ff02::1]/v1")).toThrow();
+    expect(() => assertSafeProviderUrl("https://[::ffff:127.0.0.1]/v1")).toThrow();
+    expect(() => assertSafeProviderUrl("https://[::ffff:169.254.1.1]/v1")).toThrow();
+    expect(() => assertSafeProviderUrl("https://[::ffff:172.16.1.1]/v1")).toThrow();
     expect(() => assertSafeProviderUrl("https://token@example.com/v1")).toThrow("credentials");
   });
 });
