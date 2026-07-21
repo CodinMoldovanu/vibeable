@@ -528,6 +528,8 @@ Flow:
 7. Accepted changes are committed.
 8. Deployment is built from committed source.
 
+Projects may configure an HTTPS remote with an encrypted bearer or basic credential. A logical worker binds agent runs to a named working branch and can auto-push successful target and audit branches. Projects can promote a branch into another branch, archive workspaces in place, mirror all branches before offloading workspace storage, and clone the active branch when restored.
+
 Recommended branch format:
 
 ```txt
@@ -566,13 +568,19 @@ Lifecycle:
 7. Health checks run.
 8. Deployment record and logs are saved.
 
-Supported MVP target:
+Implemented profile adapters:
 
-- Docker-based deployment.
+- Kubernetes manifests.
+- Helm releases.
+- Docker Compose.
+- Docker Swarm stacks.
+- GitOps branch push.
+- HTTPS deployment webhook for an existing internal controller.
+
+All profiles use strict adapter-specific configuration, resolve a branch to an exact commit, inject only explicitly selected resources, record bounded execution events, and support optional health checks. Production requires independent approval by default. Execution is disabled by default and local adapter commands are intended to move into a dedicated durable worker.
 
 Future targets:
 
-- Kubernetes.
 - AWS ECS.
 - Google Cloud Run.
 - Azure Container Apps.
@@ -767,6 +775,10 @@ budgets
 secrets
 deployments
 deployment_events
+deployment_profiles
+stack_profiles
+project_git_settings
+project_workers
 audit_events
 ```
 
@@ -810,7 +822,26 @@ GET    /api/projects/:id/preview/status
 POST   /api/projects/:id/deployments
 GET    /api/projects/:id/deployments
 POST   /api/deployments/:id/approve
+POST   /api/deployments/:id/execute
 POST   /api/deployments/:id/rollback
+
+GET    /api/projects/:id/delivery
+PUT    /api/projects/:id/git
+POST   /api/projects/:id/git/sync
+POST   /api/projects/:id/workers
+DELETE /api/projects/:id/workers/:workerId
+POST   /api/projects/:id/branches/promote
+POST   /api/projects/:id/archive
+POST   /api/projects/:id/restore
+DELETE /api/projects/:id
+DELETE /api/projects/:id/purge
+
+GET    /api/admin/stack-profiles
+POST   /api/admin/stack-profiles
+PATCH  /api/admin/stack-profiles/:id
+GET    /api/admin/deployment-profiles
+POST   /api/admin/deployment-profiles
+PATCH  /api/admin/deployment-profiles/:id
 
 GET    /api/admin/ai/providers
 POST   /api/admin/ai/providers

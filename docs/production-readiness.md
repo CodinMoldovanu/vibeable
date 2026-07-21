@@ -10,6 +10,8 @@ Vibeable 0.1 is a community preview for trusted internal teams. It is not yet sa
 - Editable policy-approved AI endpoints, automatic intent routing, progressive run feedback, captured preview logs, and one verification repair pass.
 - Encrypted build-time resources and project-isolated PostgreSQL roles/schemas for trusted evaluation.
 - Policy evaluation, prompt hooks, RBAC, usage reporting, and approval records.
+- Enforced stack profiles, HTTPS Git synchronization, branch workers, archive/offload/restore, and exact-commit deployment plans.
+- Allowlisted local deployment adapters with independent production approval, bounded logs, selected resource injection, health checks, and rollback planning.
 - Evaluation behind TLS with PostgreSQL and durable workspace storage.
 
 ## Required before untrusted or high-value production use
@@ -19,9 +21,9 @@ Vibeable 0.1 is a community preview for trusted internal teams. It is not yet sa
 - Serve previews from a separate origin with short-lived capability tokens.
 - Add an outbound egress proxy or network policy for provider requests. DNS/IP validation and connection pinning are implemented in-process.
 - Add OIDC/SAML, MFA delegation, password reset, email invitations, and session management UI.
-- Add repository import/export, authenticated remote pull/push, side-by-side diffs, conflict handling, and explicit accept/reject review. Git resource metadata, local branches, checkpoints, and attributed commits are implemented.
+- Add side-by-side diffs, conflict-resolution UI, explicit accept/reject review, Git host application credentials, and protected-branch status integration. HTTPS remote pull/push and encrypted bearer/basic credentials are implemented.
 - Add a dedicated generated-application runtime worker before claiming backend, SMTP, API, or managed-database resources are available to deployed applications. Current values are build-verifier inputs and static previews receive no secrets.
-- Add an actual deployment adapter and rollback implementation. Current deployment endpoints record approvals only.
+- Extract deployment execution into dedicated durable workers. Local adapters currently execute allowlisted binaries from the control-plane host; default container images intentionally do not include cluster credentials, a Docker socket, or deployment CLIs.
 - Reserve budget before concurrent calls and reconcile streamed/provider usage.
 - Add secret rotation/versioning and integrate a production secret manager.
 - Add broader browser end-to-end coverage, backup/restore drills, SLOs, and load tests. Disposable PostgreSQL API integration tests run in the standard test suite.
@@ -34,6 +36,7 @@ Vibeable 0.1 is a community preview for trusted internal teams. It is not yet sa
 - `NODE_ENV=production`, HTTPS, `COOKIE_SECURE=true`, and the exact `PUBLIC_URL` are configured.
 - A unique random `MASTER_KEY` and database password are supplied through the host secret mechanism.
 - `EXECUTION_MODE=disabled` unless a dedicated sandbox worker has been deployed and reviewed.
+- `DEPLOYMENT_EXECUTION_MODE=disabled` unless adapter binaries, credentials, egress, and isolation have been reviewed. Prefer a signed webhook to a separate deployment controller.
 - PostgreSQL and workspace backups are encrypted, monitored, and restoration-tested.
 - Logs and `/healthz` are monitored; audit retention matches company policy.
 

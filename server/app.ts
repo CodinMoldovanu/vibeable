@@ -12,17 +12,19 @@ import { can } from "../src/domain/rbac.js";
 import { inferAgentPhase } from "../src/domain/intent.js";
 import { authenticate, createSession, destroySession, getPrincipal, requirePrincipal } from "./auth.js";
 import { config } from "./config.js";
+import { registerDeliveryRoutes } from "./delivery-routes.js";
 import { pool, query, transaction } from "./db.js";
 import { subscribeToRun } from "./events.js";
 import { enqueueRun, recordRunEvent } from "./orchestrator.js";
 import { requirePermission } from "./permissions.js";
 import { resolvePolicy } from "./policy.js";
+import { assertGitBranch } from "./project-git.js";
 import { assertSafeProviderUrl, encryptSecret } from "./security.js";
 import {
   deleteProjectResource, listProjectResources, projectPreviewOrigins, provisionProjectDatabase, recordProjectLog,
   upsertProjectResource, type ResourceKind
 } from "./resources.js";
-import { getAccessibleProject, listMemberTeamIds, writeAudit } from "./store.js";
+import { assertProjectOperational, getAccessibleProject, listMemberTeamIds, writeAudit } from "./store.js";
 import { ensureWorkspace, readPreview } from "./workspace.js";
 
 const idSchema = z.string().uuid();
@@ -77,7 +79,7 @@ export function buildApp() {
   app.get("/healthz", async (_request, reply) => {
     try {
       await query("SELECT 1");
-      return { status: "ok", database: "ok", executionMode: config.EXECUTION_MODE };
+      return { status: "ok", database: "ok", executionMode: config.EXECUTION_MODE, deploymentExecutionMode: config.DEPLOYMENT_EXECUTION_MODE };
     } catch {
       return reply.code(503).send({ status: "error", database: "unavailable" });
     }
@@ -175,13 +177,22 @@ export function buildApp() {
 
   app.get("/api/projects", async (request) => {
     const principal = await requirePrincipal(request);
+    const { lifecycle } = z.object({ lifecycle: z.enum(["active", "archived", "trash", "all"]).default("active") }).parse(request.query);
     const allTeams = ["owner", "admin"].includes(principal.role);
+    const lifecycleFilter = lifecycle === "active"
+      ? "p.archived_at IS NULL AND p.deleted_at IS NULL"
+      : lifecycle === "archived"
+        ? "p.archived_at IS NOT NULL AND p.deleted_at IS NULL"
+        : lifecycle === "trash" ? "p.deleted_at IS NOT NULL" : "true";
     const result = await query(
       `SELECT p.id, p.name, p.slug, p.status, p.environment, p.team_id AS "teamId", t.name AS "teamName",
-              p.updated_at AS "updatedAt", '/api/projects/' || p.id || '/preview/' AS "previewUrl"
+              p.active_branch AS "activeBranch", p.archived_at AS "archivedAt", p.deleted_at AS "deletedAt",
+              p.offloaded_at AS "offloadedAt", p.updated_at AS "updatedAt",
+              '/api/projects/' || p.id || '/preview/' AS "previewUrl"
          FROM projects p JOIN teams t ON t.id = p.team_id
         WHERE p.organization_id = $1 AND ($2::boolean OR EXISTS (
           SELECT 1 FROM memberships m WHERE m.user_id = $3 AND m.team_id = p.team_id))
+          AND ${lifecycleFilter}
         ORDER BY p.updated_at DESC`,
       [principal.organizationId, allTeams, principal.userId]
     );
@@ -214,7 +225,7 @@ export function buildApp() {
       `SELECT r.id, r.phase, r.prompt, r.status, r.model, r.provider_id AS "providerId",
               r.progress, r.stage_message AS "stageMessage", r.repair_attempts AS "repairAttempts",
               r.commit_sha AS "commitSha", r.total_tokens AS "totalTokens",
-              r.user_id AS "userId",
+              r.user_id AS "userId", r.target_branch AS "targetBranch", r.worker_id AS "workerId",
               r.estimated_cost_usd::float8 AS "estimatedCostUsd", r.created_at AS "createdAt", r.finished_at AS "finishedAt",
               coalesce((SELECT json_agg(json_build_object('sequence', e.sequence, 'type', e.type, 'message', e.message, 'metadata', e.metadata, 'createdAt', e.created_at) ORDER BY e.sequence)
                 FROM agent_run_events e WHERE e.run_id = r.id), '[]') AS events,
@@ -234,9 +245,23 @@ export function buildApp() {
       prompt: z.string().trim().min(3).max(50_000),
       providerId: idSchema.optional(),
       model: z.string().trim().min(1).max(200).optional(),
-      phase: phaseSchema.optional()
+      phase: phaseSchema.optional(),
+      targetBranch: z.string().trim().min(1).max(200).optional(),
+      workerId: idSchema.optional()
     }).parse(request.body);
     const project = await getAccessibleProject(principal, projectId);
+    assertProjectOperational(project);
+    let targetBranch = input.targetBranch ?? project.activeBranch;
+    if (input.workerId) {
+      const worker = await query<{ workingBranch: string }>(
+        `SELECT working_branch AS "workingBranch" FROM project_workers
+          WHERE id=$1 AND organization_id=$2 AND project_id=$3 AND status='active'`,
+        [input.workerId, principal.organizationId, project.id]
+      );
+      if (!worker.rows[0]) return reply.code(400).send({ error: "Worker is not active for this project" });
+      targetBranch = worker.rows[0].workingBranch;
+    }
+    assertGitBranch(targetBranch);
     const completed = await query("SELECT 1 FROM agent_runs WHERE project_id=$1 AND status='ready' LIMIT 1", [project.id]);
     const phase = input.phase ?? inferAgentPhase(input.prompt, Boolean(completed.rowCount));
     const policy = await resolvePolicy({
@@ -250,15 +275,17 @@ export function buildApp() {
     });
     const status = policy.requireApproval ? "waiting_approval" : "queued";
     const result = await query<{ id: string }>(
-      `INSERT INTO agent_runs (organization_id, team_id, project_id, user_id, phase, prompt, status, provider_id, model)
-       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9) RETURNING id`,
+      `INSERT INTO agent_runs
+        (organization_id, team_id, project_id, user_id, phase, prompt, status, provider_id, model, target_branch, worker_id)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11) RETURNING id`,
       [principal.organizationId, project.teamId, project.id, principal.userId, phase, input.prompt,
-        status, policy.provider.id, policy.model]
+        status, policy.provider.id, policy.model, targetBranch, input.workerId ?? null]
     );
     const run = result.rows[0]!;
     await query("UPDATE projects SET status = 'building', updated_at = now() WHERE id = $1", [project.id]);
     await writeAudit(principal, "agent_run.created", "agent_run", run.id, {
-      projectId: project.id, phase, providerId: policy.provider.id, model: policy.model, status
+      projectId: project.id, phase, providerId: policy.provider.id, model: policy.model, status, targetBranch,
+      workerId: input.workerId ?? null
     }, request.ip);
     if (status === "waiting_approval") {
       await recordRunEvent(run.id, "approval", "Run is waiting for an authorized approver");
@@ -340,13 +367,14 @@ export function buildApp() {
 
   registerAdminRoutes(app);
   registerMetricsRoutes(app);
-  registerDeploymentRoutes(app);
+  registerDeliveryRoutes(app);
   registerProjectResourceRoutes(app);
 
   app.get("/api/projects/:projectId/preview/*", async (request, reply) => {
     const principal = await requirePrincipal(request);
     const params = z.object({ projectId: idSchema, "*": z.string().default("") }).parse(request.params);
-    await getAccessibleProject(principal, params.projectId);
+    const project = await getAccessibleProject(principal, params.projectId);
+    assertProjectOperational(project);
     const path = params["*"] || "index.html";
     const content = await readPreview(params.projectId, path);
     const previewOrigins = await projectPreviewOrigins(principal.organizationId, params.projectId);
@@ -360,7 +388,10 @@ export function buildApp() {
   });
 
   app.setErrorHandler((error, request, reply) => {
-    const statusCode = error instanceof ZodError ? 400 : Number((error as Error & { statusCode?: number }).statusCode ?? 500);
+    const databaseCode = (error as Error & { code?: string }).code;
+    const statusCode = error instanceof ZodError ? 400
+      : databaseCode === "23505" ? 409
+        : Number((error as Error & { statusCode?: number }).statusCode ?? 500);
     if (statusCode >= 500) request.log.error(error);
     const message = statusCode >= 500 && config.NODE_ENV === "production"
       ? "Internal server error"
@@ -612,51 +643,6 @@ function registerMetricsRoutes(app: FastifyInstance) {
   });
 }
 
-function registerDeploymentRoutes(app: FastifyInstance) {
-  app.get("/api/projects/:projectId/deployments", async (request) => {
-    const principal = await requirePrincipal(request); const { projectId } = z.object({ projectId: idSchema }).parse(request.params);
-    await getAccessibleProject(principal, projectId);
-    const result = await query(
-      `SELECT id, environment, status, requested_by AS "requestedBy", approved_by AS "approvedBy",
-              commit_sha AS "commitSha", created_at AS "createdAt", updated_at AS "updatedAt"
-         FROM deployments WHERE project_id = $1 ORDER BY created_at DESC`,
-      [projectId]
-    );
-    return { deployments: result.rows };
-  });
-  app.post("/api/projects/:projectId/deployments", async (request, reply) => {
-    const principal = await requirePrincipal(request); requirePermission(principal, "deployment:create");
-    const { projectId } = z.object({ projectId: idSchema }).parse(request.params); const project = await getAccessibleProject(principal, projectId);
-    const input = z.object({ environment: z.enum(["staging", "production"]) }).parse(request.body);
-    const status = input.environment === "production" ? "waiting_approval" : "approved";
-    const result = await query<{ id: string }>(
-      `INSERT INTO deployments (organization_id, project_id, requested_by, environment, status) VALUES ($1,$2,$3,$4,$5) RETURNING id`,
-      [principal.organizationId, project.id, principal.userId, input.environment, status]
-    );
-    await writeAudit(principal, "deployment.created", "deployment", result.rows[0]!.id, { projectId: project.id, environment: input.environment }, request.ip);
-    return reply.code(201).send({ id: result.rows[0]!.id, status });
-  });
-  app.post("/api/deployments/:deploymentId/approve", async (request) => {
-    const principal = await requirePrincipal(request); requirePermission(principal, "deployment:approve");
-    const { deploymentId } = z.object({ deploymentId: idSchema }).parse(request.params);
-    const existing = await query<{ project_id: string }>(
-      "SELECT project_id FROM deployments WHERE id=$1 AND organization_id=$2",
-      [deploymentId, principal.organizationId]
-    );
-    if (!existing.rows[0]) throw Object.assign(new Error("Deployment not found"), { statusCode: 404 });
-    await getAccessibleProject(principal, existing.rows[0].project_id);
-    const result = await query<{ id: string }>(
-      `UPDATE deployments SET status='approved', approved_by=$2, updated_at=now()
-        WHERE id=$1 AND organization_id=$3 AND status='waiting_approval'
-          AND ($4::boolean = false OR requested_by <> $2) RETURNING id`,
-      [deploymentId, principal.userId, principal.organizationId, config.requireSeparateApprover]
-    );
-    if (!result.rows[0]) throw Object.assign(new Error("Deployment is not awaiting approval or requires a different approver"), { statusCode: 409 });
-    await writeAudit(principal, "deployment.approved", "deployment", deploymentId, {}, request.ip);
-    return { ok: true };
-  });
-}
-
 function registerProjectResourceRoutes(app: FastifyInstance) {
   app.get("/api/projects/:projectId/resources", async (request) => {
     const principal = await requirePrincipal(request);
@@ -668,7 +654,7 @@ function registerProjectResourceRoutes(app: FastifyInstance) {
   app.post("/api/projects/:projectId/resources", async (request, reply) => {
     const principal = await requirePrincipal(request); requirePermission(principal, "project:update");
     const { projectId } = z.object({ projectId: idSchema }).parse(request.params);
-    await getAccessibleProject(principal, projectId);
+    const project = await getAccessibleProject(principal, projectId); assertProjectOperational(project);
     const input = z.object({
       kind: z.enum(["secret", "api", "smtp", "git", "service"]),
       name: z.string().trim().toUpperCase().regex(/^[A-Z][A-Z0-9_]{1,63}$/),
@@ -707,7 +693,7 @@ function registerProjectResourceRoutes(app: FastifyInstance) {
   app.post("/api/projects/:projectId/resources/database", async (request, reply) => {
     const principal = await requirePrincipal(request); requirePermission(principal, "secret:update");
     const { projectId } = z.object({ projectId: idSchema }).parse(request.params);
-    await getAccessibleProject(principal, projectId);
+    const project = await getAccessibleProject(principal, projectId); assertProjectOperational(project);
     const id = await provisionProjectDatabase({ organizationId: principal.organizationId, projectId, userId: principal.userId });
     await writeAudit(principal, "project_database.provisioned", "project_resource", id, { projectId }, request.ip);
     return reply.code(201).send({ id });
@@ -716,7 +702,7 @@ function registerProjectResourceRoutes(app: FastifyInstance) {
   app.delete("/api/projects/:projectId/resources/:resourceId", async (request) => {
     const principal = await requirePrincipal(request); requirePermission(principal, "secret:update");
     const { projectId, resourceId } = z.object({ projectId: idSchema, resourceId: idSchema }).parse(request.params);
-    await getAccessibleProject(principal, projectId);
+    const project = await getAccessibleProject(principal, projectId); assertProjectOperational(project);
     if (!await deleteProjectResource(principal.organizationId, projectId, resourceId)) {
       throw Object.assign(new Error("Project resource not found"), { statusCode: 404 });
     }
@@ -739,7 +725,7 @@ function registerProjectResourceRoutes(app: FastifyInstance) {
   app.post("/api/projects/:projectId/logs", async (request, reply) => {
     const principal = await requirePrincipal(request);
     const { projectId } = z.object({ projectId: idSchema }).parse(request.params);
-    await getAccessibleProject(principal, projectId);
+    const project = await getAccessibleProject(principal, projectId); assertProjectOperational(project);
     const input = z.object({
       level: z.enum(["debug", "info", "warn", "error"]),
       message: z.string().trim().min(1).max(4000)

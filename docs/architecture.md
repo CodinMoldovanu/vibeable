@@ -19,6 +19,9 @@ flowchart LR
   Preview -->|console and errors| Logs["Runtime log buffer"]
   Logs --> Agent
   Resources --> Executor
+  API --> Git["Git remote and branch workers"]
+  API --> Delivery["Deployment profile worker"]
+  Delivery --> Targets["Kubernetes / Helm / Swarm / Compose / GitOps / Webhook"]
 ```
 
 ## Trust boundaries
@@ -41,11 +44,17 @@ Prompt hooks matching the run phase are gathered from every applicable scope and
 2. The orchestrator resolves policy and checks current-month usage.
 3. It loads bounded text context, resource names, and recent redacted build/preview logs.
 4. The selected endpoint returns structured whole-file edits.
-5. Existing workspace changes are checkpointed, then a run-specific Git branch is created and path-safe edits are applied one file at a time.
-6. Verification follows the configured execution mode with resource values injected into the verifier environment.
+5. Existing workspace changes are checkpointed, then a run-specific Git branch is created from the selected project or worker branch and path-safe edits are applied one file at a time.
+6. The effective stack profile is validated, then verification follows the configured execution mode with resource values injected into the verifier environment.
 7. Provider usage is persisted after every attempt, including attempts followed by failed verification.
 8. Failed verification logs are sent through one repair pass; secrets are redacted before storage or model feedback.
-9. Successful edits are committed with run, user, provider, model, and usage metadata, then fast-forwarded to `main`.
+9. Successful edits are committed with run, user, provider, model, and usage metadata, fast-forwarded to the target branch, and optionally pushed to the configured remote.
 10. Events are persisted and streamed. Reconnecting clients replay prior events, with client polling as a fallback.
 
 The in-process orchestrator is suitable for one control-plane replica. Horizontal scaling requires a durable queue and dedicated workers before multiple replicas are started.
+
+## Delivery lifecycle
+
+Deployment profiles are scoped to a team or project and use a strict adapter-specific schema. A deployment resolves a branch to an exact commit, validates referenced workspace paths and endpoints, and snapshots the profile name, adapter configuration, and selected resource names into an immutable plan. Production plans require an independent approver. Execution checks out the recorded commit into a detached worktree, injects only the snapshotted resources, runs a fixed adapter command without a shell, records bounded redacted output, and performs an optional pinned health check. Rollback creates a new governed deployment for the prior successful commit.
+
+Projects can be archived in place or mirrored to Git and offloaded from workspace storage. Trash is reversible; permanent purge is owner-only and removes managed resources, database records, and workspace data.

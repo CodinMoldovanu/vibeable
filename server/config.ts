@@ -13,6 +13,7 @@ const schema = z.object({
   SESSION_TTL_DAYS: z.coerce.number().int().min(1).max(90).default(14),
   REQUIRE_SEPARATE_APPROVER: z.enum(["true", "false"]).default("true"),
   EXECUTION_MODE: z.enum(["disabled", "local", "docker"]).default("disabled"),
+  DEPLOYMENT_EXECUTION_MODE: z.enum(["disabled", "local"]).default("disabled"),
   ALLOW_PRIVATE_AI_ENDPOINTS: z.enum(["true", "false"]).default("false"),
   COOKIE_SECURE: z.enum(["true", "false"]).optional(),
   TRUST_PROXY: z.enum(["true", "false"]).default("false"),

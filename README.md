@@ -8,7 +8,11 @@ This repository is a self-hosted community edition, not a claim of feature-for-f
 
 ### Builder and live preview
 
-![Vibeable builder with an agent timeline, generated inventory application preview, and changed files](docs/screenshots/builder.jpg)
+![Vibeable builder with an agent timeline, generated inventory application preview, branch selection, and changed files](docs/screenshots/builder.jpg)
+
+### Technology and delivery governance
+
+![Vibeable enforced stack profiles and team-scoped deployment adapters](docs/screenshots/delivery.jpg)
 
 ### Scoped token usage
 
@@ -36,13 +40,16 @@ Screenshots use local demo records and contain no production credentials.
 - Automatic lifecycle intent selection plus scoped prompt hooks and approval flags.
 - Structured AI file edits with path traversal and binary/context limits.
 - Git-backed projects with an agent branch and attributed commit for every successful run.
+- Configurable HTTPS Git remotes, encrypted bearer/basic credentials, pull/push, mirror offload and restore, branch promotion, and branch-bound logical workers with optional auto-push.
+- Active, archived, offloaded, and trash project views with guarded restore and owner-only permanent purge.
+- Enforceable global, team, or project technology profiles for languages, frameworks, package managers, dependencies, required files/scripts, and container base images.
 - Persisted progress, elapsed time, per-file events, reconnecting SSE, and polling fallback.
 - Preview console/error capture and build logs fed into the next repair or agent pass as untrusted diagnostic context.
 - Write-only project secrets, API/SMTP/service/Git metadata, and project-isolated managed PostgreSQL credentials.
 - One automatic repair pass when workspace verification fails; every provider attempt is included in token and cost accounting.
 - Authenticated live preview with desktop, tablet, and mobile sizing.
 - Selectable global, team, user, and project token/cost dashboards.
-- Independent approval gates for governed agent runs and production deployment records.
+- Team/project deployment profiles for Kubernetes, Helm, Docker Swarm, Compose, GitOps, or webhooks, with exact-commit plans, selected secret injection, event logs, health checks, production approval, execution, and rollback records.
 - Docker Compose packaging, checksummed migrations, health checks, PostgreSQL integration tests, CI, and security documentation.
 
 ## Quick start with Docker
@@ -87,12 +94,13 @@ The web UI runs at `http://127.0.0.1:5173`; the API runs at `http://127.0.0.1:87
 | `REQUIRE_SEPARATE_APPROVER` | `true` | Prevents users approving their own governed runs or deployments |
 | `TRUST_PROXY` | `false` | Trust reverse-proxy forwarding headers |
 | `EXECUTION_MODE` | `disabled` | `disabled`, `local`, or `docker` workspace verification |
+| `DEPLOYMENT_EXECUTION_MODE` | `disabled` | `disabled` or `local` allowlisted deployment adapters |
 | `ALLOW_PRIVATE_AI_ENDPOINTS` | `false` | Allows HTTP/private OpenAI-compatible endpoints |
 | `DATA_DIR` | `.vibeable` | Project workspace storage |
 
 `local` execution runs generated package scripts on the host and is only for a trusted developer machine. Shared installations should use a separately hardened Docker worker; see the threat model.
 
-Project resource values are injected only into configured build verification today. Static previews never receive secret values. Managed PostgreSQL creates an isolated role and schema, but running a generated backend against it requires the dedicated application worker listed in [Production readiness](docs/production-readiness.md). Git resources currently provide repository metadata to the agent; remote clone/pull/push is not yet executed by the control plane.
+Static previews never receive secret values. Managed PostgreSQL creates an isolated role and schema; generated backends still require an application runtime worker. Deployment profiles receive only explicitly named resources. Keep deployment execution disabled in the default control-plane container: `local` adapters require operator-installed `kubectl`, `helm`, or `docker` binaries and should run in a dedicated worker. The webhook and GitOps adapters are the safer integration points for an existing deployment controller.
 
 ## Development commands
 

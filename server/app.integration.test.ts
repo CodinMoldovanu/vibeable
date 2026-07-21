@@ -173,13 +173,34 @@ describe("PostgreSQL API integration", () => {
     const projectUsage = (await authenticated("GET", `/api/metrics/usage?scope=project&id=${defaultProjectId}`, developerCookie)).json().usage;
     expect(projectUsage).toEqual([expect.objectContaining({ model: "test/model", totalTokens: 20, requests: 1 })]);
 
-    const deployment = await authenticated("POST", `/api/projects/${defaultProjectId}/deployments`, ownerCookie, { environment: "production" });
+    const profile = await authenticated("POST", "/api/admin/deployment-profiles", ownerCookie, {
+      scopeType: "team", scopeId: defaultTeamId, name: "Production GitOps", adapter: "gitops",
+      environment: "production", config: {}, resourceNames: [], enabled: true
+    });
+    expect(profile.statusCode).toBe(201);
+    const deployment = await authenticated("POST", `/api/projects/${defaultProjectId}/deployments`, ownerCookie, { profileId: profile.json().id });
     const deploymentId = deployment.json().id as string;
     expect(deployment.json().status).toBe("waiting_approval");
-    expect((await authenticated("POST", `/api/deployments/${deploymentId}/approve`, ownerCookie)).statusCode).toBe(409);
+    expect((await authenticated("PATCH", `/api/admin/deployment-profiles/${profile.json().id}`, ownerCookie, {
+      scopeType: "team", scopeId: defaultTeamId, name: "Changed Production GitOps", adapter: "gitops",
+      environment: "production", config: { branch: "release" }, resourceNames: ["DEPLOY_TOKEN"], enabled: true
+    })).statusCode).toBe(200);
+    const snapshot = await databasePool.query<{ profileName: string; adapterConfig: Record<string, unknown>; resourceNames: string[] }>(
+      `SELECT deployment_profile_name AS "profileName",adapter_config AS "adapterConfig",resource_names AS "resourceNames" FROM deployments WHERE id=$1`,
+      [deploymentId]
+    );
+    expect(snapshot.rows[0]).toEqual({ profileName: "Production GitOps", adapterConfig: { expectedStatus: 200 }, resourceNames: [] });
+    const requesterApproval = await authenticated("POST", `/api/deployments/${deploymentId}/approve`, ownerCookie);
+    expect(requesterApproval.statusCode, requesterApproval.body).toBe(409);
     expect((await authenticated("POST", `/api/deployments/${deploymentId}/approve`, reviewerCookie)).statusCode).toBe(200);
+    expect((await databasePool.query("SELECT approved_at FROM deployments WHERE id=$1", [deploymentId])).rows[0]?.approved_at).toBeInstanceOf(Date);
+    expect((await authenticated("POST", `/api/deployments/${deploymentId}/execute`, developerCookie)).statusCode).toBe(409);
 
-    const otherDeployment = await authenticated("POST", `/api/projects/${secondProjectId}/deployments`, ownerCookie, { environment: "production" });
+    const otherProfile = await authenticated("POST", "/api/admin/deployment-profiles", ownerCookie, {
+      scopeType: "team", scopeId: secondTeamId, name: "Other Production GitOps", adapter: "gitops",
+      environment: "production", config: {}, resourceNames: [], enabled: true
+    });
+    const otherDeployment = await authenticated("POST", `/api/projects/${secondProjectId}/deployments`, ownerCookie, { profileId: otherProfile.json().id });
     expect(otherDeployment.statusCode).toBe(201);
     expect((await authenticated("POST", `/api/deployments/${otherDeployment.json().id}/approve`, reviewerCookie)).statusCode).toBe(404);
   }, 20_000);
@@ -238,9 +259,45 @@ describe("PostgreSQL API integration", () => {
     expect(removedRole.rowCount).toBe(0);
     expect((await authenticated("DELETE", `/api/projects/${defaultProjectId}/resources/${resource.json().id}`, ownerCookie)).statusCode).toBe(200);
   });
+
+  it("enforces stack selection and project Git worker lifecycle", async () => {
+    const projectId = (await authenticated("POST", "/api/projects", ownerCookie, { name: "Lifecycle App", teamId: defaultTeamId })).json().id as string;
+    const organizationId = (await authenticated("GET", "/api/session", ownerCookie)).json().user.organizationId as string;
+    const stack = await authenticated("POST", "/api/admin/stack-profiles", ownerCookie, {
+      scopeType: "global", scopeId: organizationId, name: "TypeScript baseline", description: "Approved runtime",
+      rules: { allowedLanguages: ["typescript", "javascript"], allowedFrameworks: [], allowedPackageManagers: [], allowedBaseImages: [], requiredFiles: [], requiredDependencies: [], forbiddenDependencies: [], requiredScripts: [] },
+      isDefault: true, enabled: true
+    });
+    expect(stack.statusCode).toBe(201);
+    expect((await authenticated("POST", `/api/projects/${projectId}/stack-profile`, ownerCookie, { profileId: stack.json().id })).statusCode).toBe(200);
+
+    const worker = await authenticated("POST", `/api/projects/${projectId}/workers`, developerCookie, {
+      name: "Checkout worker", baseBranch: "main", workingBranch: "feature/checkout", autoPush: false
+    });
+    expect(worker.statusCode).toBe(201);
+    const delivery = (await authenticated("GET", `/api/projects/${projectId}/delivery`, ownerCookie)).json();
+    expect(delivery.branches).toContain("feature/checkout");
+    expect(delivery.workers).toContainEqual(expect.objectContaining({ id: worker.json().id, workingBranch: "feature/checkout", status: "active" }));
+
+    expect((await authenticated("PUT", `/api/projects/${projectId}/git`, developerCookie, {
+      repositoryUrl: "https://example.test/vibeable.git", defaultBranch: "main", branchPrefix: "vibeable/",
+      syncMode: "mirror", credentialType: "bearer", enabled: false
+    })).statusCode).toBe(200);
+    expect((await authenticated("POST", `/api/projects/${projectId}/archive`, developerCookie, { offload: true })).statusCode).toBe(409);
+    expect((await authenticated("POST", `/api/projects/${projectId}/archive`, developerCookie, { offload: false })).statusCode).toBe(200);
+    expect(((await authenticated("GET", "/api/projects", ownerCookie)).json().projects as Array<{ id: string }>).some((project) => project.id === projectId)).toBe(false);
+    expect(((await authenticated("GET", "/api/projects?lifecycle=archived", ownerCookie)).json().projects as Array<{ id: string }>).some((project) => project.id === projectId)).toBe(true);
+    expect((await authenticated("POST", `/api/projects/${projectId}/runs`, developerCookie, { prompt: "Change archived app" })).statusCode).toBe(409);
+    expect((await authenticated("POST", `/api/projects/${projectId}/restore`, developerCookie)).statusCode).toBe(200);
+    expect((await authenticated("DELETE", `/api/projects/${projectId}`, developerCookie)).statusCode).toBe(200);
+    expect(((await authenticated("GET", "/api/projects?lifecycle=trash", ownerCookie)).json().projects as Array<{ id: string }>).some((project) => project.id === projectId)).toBe(true);
+    expect((await authenticated("DELETE", `/api/projects/${projectId}/purge`, developerCookie)).statusCode).toBe(403);
+    expect((await authenticated("DELETE", `/api/projects/${projectId}/purge`, ownerCookie)).statusCode).toBe(200);
+    expect((await authenticated("GET", `/api/projects/${projectId}/delivery`, ownerCookie)).statusCode).toBe(404);
+  });
 });
 
-async function authenticated(method: "GET" | "POST" | "PATCH" | "DELETE", url: string, cookie: string, payload?: Record<string, unknown>) {
+async function authenticated(method: "GET" | "POST" | "PUT" | "PATCH" | "DELETE", url: string, cookie: string, payload?: Record<string, unknown>) {
   return app.inject({ method, url, headers: { cookie, ...(!["GET", "HEAD"].includes(method) ? csrf : {}) }, payload });
 }
 

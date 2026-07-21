@@ -1,14 +1,14 @@
 import {
-  Activity, Bot, Boxes, Check, ChevronDown, CircleDollarSign, Cloud, Code2, FileCode2,
+  Activity, Archive, Bot, Boxes, Check, ChevronDown, CircleDollarSign, Cloud, Code2, FileCode2,
   Database, Gauge, GitBranch, KeyRound, LayoutDashboard, LoaderCircle, Lock, LogOut,
-  MessageSquare, Monitor, Pencil, Play, Plug, Plus, Menu, RefreshCw, Rocket, ScrollText,
-  ShieldCheck, Smartphone, Tablet, Terminal, Trash2, Users, X, Zap
+  MessageSquare, Monitor, Pencil, Play, Plug, Plus, Menu, RefreshCw, Rocket, RotateCcw, ScrollText,
+  Server, ShieldCheck, Smartphone, Tablet, Terminal, Trash2, UploadCloud, Users, X, Zap
 } from "lucide-react";
 import { useCallback, useEffect, useMemo, useRef, useState, type FormEvent, type ReactNode } from "react";
 import { api, ApiError } from "./api";
 import type { AgentPhase, EffectiveAiPolicy, Role } from "./domain/types";
 
-type RightPanelTab = "files" | "logs" | "resources" | "metrics" | "deploy";
+type RightPanelTab = "files" | "logs" | "resources" | "git" | "metrics" | "deploy";
 type ViewportMode = "desktop" | "tablet" | "mobile";
 
 interface Session {
@@ -17,7 +17,8 @@ interface Session {
 }
 interface Project {
   id: string; name: string; slug: string; status: string; environment: string;
-  teamId: string; teamName: string; updatedAt: string; previewUrl: string;
+  teamId: string; teamName: string; updatedAt: string; previewUrl: string; activeBranch: string;
+  archivedAt?: string; deletedAt?: string; offloadedAt?: string;
 }
 interface RunEvent { sequence: number; type: string; message: string; metadata: Record<string, unknown>; createdAt: string }
 interface ChangedFile { path: string; additions: number; deletions: number; summary: string }
@@ -25,13 +26,23 @@ interface Run {
   id: string; userId: string; phase: AgentPhase; prompt: string; status: string; providerId?: string; model?: string;
   commitSha?: string; totalTokens: number; estimatedCostUsd: number; progress: number; stageMessage: string;
   repairAttempts: number; createdAt: string; finishedAt?: string; events: RunEvent[]; files: ChangedFile[];
+  targetBranch: string; workerId?: string;
 }
 interface UsageRow { day: string; model: string; inputTokens: number; outputTokens: number; totalTokens: number; estimatedCostUsd: number; requests: number }
 interface MetricScope { scope: "global" | "team" | "user" | "project"; id: string; label: string }
-interface Deployment { id: string; environment: string; status: string; requestedBy: string; approvedBy?: string; commitSha?: string; createdAt: string }
+interface DeploymentEvent { id: string; type: string; level: string; message: string; createdAt: string }
+interface Deployment { id: string; environment: string; status: string; requestedBy: string; approvedBy?: string; commitSha?: string; branch: string; profileName?: string; adapter?: string; createdAt: string; events: DeploymentEvent[] }
 interface ProviderOption { id: string; name: string; defaultModel: string; allowedModels: string[] }
 interface ProjectResource { id: string; kind: "secret" | "api" | "smtp" | "database" | "git" | "service"; name: string; environment: string; config: Record<string, unknown>; configured: boolean; updatedAt: string }
 interface RuntimeLog { id: string; runId?: string; source: string; level: "debug" | "info" | "warn" | "error"; message: string; createdAt: string }
+interface ProjectWorker { id: string; name: string; baseBranch: string; workingBranch: string; autoPush: boolean; status: string; lastRunId?: string }
+interface DeploymentProfile { id: string; name: string; adapter: string; environment: "staging" | "production"; config: Record<string, unknown>; resourceNames: string[]; enabled: boolean }
+interface StackProfileOption { id: string; name: string; description: string; scopeType: string; isDefault: boolean }
+interface DeliveryState {
+  git: null | { repositoryUrl: string; defaultBranch: string; branchPrefix: string; syncMode: "mirror" | "source"; credentialType: "bearer" | "basic"; enabled: boolean; hasCredential: boolean; lastSyncAt?: string; lastSyncStatus?: string };
+  branches: string[]; workers: ProjectWorker[]; deploymentProfiles: DeploymentProfile[]; stackProfiles: StackProfileOption[];
+  activeBranch: string; stackProfileId?: string; archivedAt?: string; deletedAt?: string; offloadedAt?: string;
+}
 
 const phases: AgentPhase[] = [
   "project:create", "agent:before_plan", "agent:before_edit", "agent:after_edit", "agent:after_error",
@@ -114,19 +125,23 @@ function Builder({ session, onLogout }: { session: Session; onLogout: () => Prom
   const [model, setModel] = useState("");
   const [resources, setResources] = useState<ProjectResource[]>([]);
   const [logs, setLogs] = useState<RuntimeLog[]>([]);
+  const [delivery, setDelivery] = useState<DeliveryState | null>(null);
+  const [targetBranch, setTargetBranch] = useState("main");
+  const [workerId, setWorkerId] = useState("");
+  const [projectLifecycle, setProjectLifecycle] = useState<"active" | "archived" | "trash">("active");
   const [projectTeams, setProjectTeams] = useState<Array<{ id: string; name: string }>>(session.teams);
   const [tab, setTab] = useState<RightPanelTab>("files");
   const [viewport, setViewport] = useState<ViewportMode>("desktop");
   const [prompt, setPrompt] = useState("");
   const [error, setError] = useState("");
   const [createOpen, setCreateOpen] = useState(false);
-  const [view, setView] = useState<"builder" | "teams" | "policy">("builder");
+  const [view, setView] = useState<"builder" | "teams" | "policy" | "delivery">("builder");
   const [sidebarOpen, setSidebarOpen] = useState(false);
 
   const loadProjects = useCallback(async () => {
-    const result = await api<{ projects: Project[] }>("/api/projects"); setProjects(result.projects);
-    setProjectId((current) => current || result.projects[0]?.id || "");
-  }, []);
+    const result = await api<{ projects: Project[] }>(`/api/projects?lifecycle=${projectLifecycle}`); setProjects(result.projects);
+    setProjectId((current) => result.projects.some((project) => project.id === current) ? current : result.projects[0]?.id || "");
+  }, [projectLifecycle]);
   const loadProjectTeams = useCallback(async () => {
     if (!["owner", "admin"].includes(session.user.role)) return setProjectTeams(session.teams);
     const result = await api<{ teams: Array<{ id: string; name: string }> }>("/api/admin/teams");
@@ -134,16 +149,20 @@ function Builder({ session, onLogout }: { session: Session; onLogout: () => Prom
   }, [session]);
   const refreshProject = useCallback(async () => {
     if (!projectId) return;
-    const [runResult, policyResult, deploymentResult, providerResult, resourceResult, logResult] = await Promise.all([
+    const [runResult, policyResult, deploymentResult, providerResult, resourceResult, logResult, deliveryResult] = await Promise.all([
       api<{ runs: Run[] }>(`/api/projects/${projectId}/runs`),
       api<{ policy: EffectiveAiPolicy }>(`/api/projects/${projectId}/policy`),
       api<{ deployments: Deployment[] }>(`/api/projects/${projectId}/deployments`),
       api<{ providers: ProviderOption[]; selected: { providerId: string; model: string } }>(`/api/projects/${projectId}/provider-options`),
       api<{ resources: ProjectResource[] }>(`/api/projects/${projectId}/resources`),
-      api<{ logs: RuntimeLog[] }>(`/api/projects/${projectId}/logs`)
+      api<{ logs: RuntimeLog[] }>(`/api/projects/${projectId}/logs`),
+      api<DeliveryState>(`/api/projects/${projectId}/delivery`)
     ]);
     setRuns(runResult.runs); setPolicy(policyResult.policy); setDeployments(deploymentResult.deployments);
     setProviderOptions(providerResult.providers); setResources(resourceResult.resources); setLogs(logResult.logs);
+    setDelivery(deliveryResult);
+    setTargetBranch((current) => deliveryResult.branches.includes(current) ? current : deliveryResult.activeBranch || "main");
+    setWorkerId((current) => deliveryResult.workers.some((worker) => worker.id === current && worker.status === "active") ? current : "");
     setProviderId((current) => providerResult.providers.some((provider) => provider.id === current) ? current : providerResult.selected.providerId);
     setModel((current) => providerResult.providers.some((provider) => provider.id === providerId && provider.allowedModels.includes(current)) ? current : providerResult.selected.model);
   }, [projectId, providerId]);
@@ -180,7 +199,7 @@ function Builder({ session, onLogout }: { session: Session; onLogout: () => Prom
   async function startRun() {
     if (!projectId || !prompt.trim()) return;
     setError("");
-    try { await api(`/api/projects/${projectId}/runs`, { method: "POST", body: JSON.stringify({ prompt, providerId, model }) }); setPrompt(""); await refreshProject(); }
+    try { await api(`/api/projects/${projectId}/runs`, { method: "POST", body: JSON.stringify({ prompt, providerId, model, targetBranch, workerId: workerId || undefined }) }); setPrompt(""); await refreshProject(); }
     catch (reason) { setError(reason instanceof Error ? reason.message : "Run failed to start"); }
   }
   async function approveRun() {
@@ -194,16 +213,25 @@ function Builder({ session, onLogout }: { session: Session; onLogout: () => Prom
     try { const result = await api<{ id: string }>("/api/projects", { method: "POST", body: JSON.stringify(data) }); await loadProjects(); await loadMetricScopes(); setProjectId(result.id); setCreateOpen(false); }
     catch (reason) { setError(reason instanceof Error ? reason.message : "Project creation failed"); }
   }
-  async function createDeployment(environment: "staging" | "production") {
+  async function createDeployment(profileId: string, branch: string) {
     if (!projectId) return;
     setError("");
-    try { await api(`/api/projects/${projectId}/deployments`, { method: "POST", body: JSON.stringify({ environment }) }); await refreshProject(); }
+    try { await api(`/api/projects/${projectId}/deployments`, { method: "POST", body: JSON.stringify({ profileId, branch }) }); await refreshProject(); }
     catch (reason) { setError(reason instanceof Error ? reason.message : "Deployment request failed"); }
   }
   async function approveDeployment(deploymentId: string) {
     setError("");
     try { await api(`/api/deployments/${deploymentId}/approve`, { method: "POST" }); await refreshProject(); }
     catch (reason) { setError(reason instanceof Error ? reason.message : "Deployment approval failed"); }
+  }
+  async function deploymentAction(deploymentId: string, action: "execute" | "rollback") {
+    await api(`/api/deployments/${deploymentId}/${action}`, { method: "POST" }); await refreshProject();
+  }
+  async function projectAction(action: "archive" | "restore" | "trash" | "purge", body?: unknown) {
+    if (!projectId) return;
+    const path = action === "trash" ? `/api/projects/${projectId}` : action === "purge" ? `/api/projects/${projectId}/purge` : `/api/projects/${projectId}/${action}`;
+    await api(path, { method: action === "trash" || action === "purge" ? "DELETE" : "POST", body: body ? JSON.stringify(body) : undefined });
+    await loadProjects();
   }
   async function saveResource(input: Record<string, unknown>) {
     await api(`/api/projects/${projectId}/resources`, { method: "POST", body: JSON.stringify(input) });
@@ -221,26 +249,27 @@ function Builder({ session, onLogout }: { session: Session; onLogout: () => Prom
   return <main className="appShell">
     <aside className={`sidebar ${sidebarOpen ? "open" : ""}`}>
       <div className="brandLockup"><div className="brandMark"><Zap size={18} /></div><div><strong>Vibeable</strong><span>{session.user.organizationName}</span></div><button className="miniIcon sidebarClose" title="Close navigation" onClick={() => setSidebarOpen(false)}><X size={17} /></button></div>
-      <nav className="navStack" aria-label="Main navigation"><button className={`navItem ${view === "builder" ? "active" : ""}`} onClick={() => { setView("builder"); setSidebarOpen(false); }}><LayoutDashboard size={18} />Builder</button><button className="navItem" onClick={() => { setView("builder"); setTab("metrics"); setSidebarOpen(false); }}><Gauge size={18} />Usage</button>{["owner", "admin"].includes(session.user.role) && <><button className={`navItem ${view === "teams" ? "active" : ""}`} onClick={() => { setView("teams"); setSidebarOpen(false); }}><Users size={18} />Teams & users</button><button className={`navItem ${view === "policy" ? "active" : ""}`} onClick={() => { setView("policy"); setSidebarOpen(false); }}><ShieldCheck size={18} />AI governance</button></>}</nav>
+      <nav className="navStack" aria-label="Main navigation"><button className={`navItem ${view === "builder" ? "active" : ""}`} onClick={() => { setView("builder"); setSidebarOpen(false); }}><LayoutDashboard size={18} />Builder</button><button className="navItem" onClick={() => { setView("builder"); setTab("metrics"); setSidebarOpen(false); }}><Gauge size={18} />Usage</button>{["owner", "admin"].includes(session.user.role) && <><button className={`navItem ${view === "teams" ? "active" : ""}`} onClick={() => { setView("teams"); setSidebarOpen(false); }}><Users size={18} />Teams & users</button><button className={`navItem ${view === "policy" ? "active" : ""}`} onClick={() => { setView("policy"); setSidebarOpen(false); }}><ShieldCheck size={18} />AI governance</button><button className={`navItem ${view === "delivery" ? "active" : ""}`} onClick={() => { setView("delivery"); setSidebarOpen(false); }}><Server size={18} />Stacks & delivery</button></>}</nav>
       <section className="sideSection"><div className="sectionTitleRow"><span className="sectionTitle">Projects</span><button className="miniIcon" title="Create project" onClick={() => setCreateOpen(!createOpen)}><Plus size={15} /></button></div>
+        <div className="projectFilters"><button className={projectLifecycle === "active" ? "active" : ""} onClick={() => setProjectLifecycle("active")}>Active</button><button className={projectLifecycle === "archived" ? "active" : ""} onClick={() => setProjectLifecycle("archived")}>Archive</button><button className={projectLifecycle === "trash" ? "active" : ""} onClick={() => setProjectLifecycle("trash")}>Trash</button></div>
         {createOpen && <form className="quickCreate" onSubmit={createProject}><input name="name" placeholder="Project name" required /><select name="teamId" required>{projectTeams.map((team) => <option key={team.id} value={team.id}>{team.name}</option>)}</select><button className="primaryButton">Create</button></form>}
         <div className="projectList">{projects.map((project) => <button className={`projectButton ${project.id === projectId ? "selected" : ""}`} key={project.id} onClick={() => { setProjectId(project.id); setSidebarOpen(false); }}><span>{project.name}</span><small>{project.environment}</small></button>)}</div>
       </section>
       <div className="accountBlock"><div><strong>{session.user.name}</strong><span>{session.user.role}</span></div><button className="miniIcon" title="Sign out" onClick={() => void onLogout()}><LogOut size={16} /></button></div>
     </aside>
     <section className="workspace">
-      <header className="topbar"><button className="iconButton mobileMenuButton" title="Open navigation" onClick={() => setSidebarOpen(true)}><Menu size={18} /></button><div className="topbarTitle"><div className="eyebrow">{view === "builder" ? activeProject?.teamName ?? "Workspace" : "Organization administration"}</div><h1>{view === "teams" ? "Teams & users" : view === "policy" ? "AI governance" : activeProject?.name ?? "Create a project"}</h1></div><div className="topbarActions">{view === "builder" && activeProject && <StatusPill label={activeProject.status} tone="blue" />}{view === "builder" && policy && <StatusPill label={policy.provider.name} tone="green" />}<button className="iconButton" title="Refresh" onClick={() => view === "builder" ? void refreshProject() : setView(view)}><RefreshCw size={18} /></button></div></header>
+      <header className="topbar"><button className="iconButton mobileMenuButton" title="Open navigation" onClick={() => setSidebarOpen(true)}><Menu size={18} /></button><div className="topbarTitle"><div className="eyebrow">{view === "builder" ? activeProject?.teamName ?? "Workspace" : "Organization administration"}</div><h1>{view === "teams" ? "Teams & users" : view === "policy" ? "AI governance" : view === "delivery" ? "Stacks & delivery" : activeProject?.name ?? "Create a project"}</h1></div><div className="topbarActions">{view === "builder" && activeProject && <StatusPill label={activeProject.status} tone="blue" />}{view === "builder" && policy && <StatusPill label={policy.provider.name} tone="green" />}<button className="iconButton" title="Refresh" onClick={() => view === "builder" ? void refreshProject() : setView(view)}><RefreshCw size={18} /></button></div></header>
       {error && <div className="errorBanner" role="alert">{error}<button onClick={() => setError("")}>Dismiss</button></div>}
-      {view !== "builder" ? <GovernancePanel mode={view} session={session} projects={projects} onError={setError} /> : !activeProject ? <EmptyProject onCreate={() => setCreateOpen(true)} /> : <section className="mainGrid">
-        <ChatPanel prompt={prompt} run={activeRun} providers={providerOptions} providerId={providerId} model={model} canApprove={Boolean(activeRun?.status === "waiting_approval" && activeRun.userId !== session.user.userId && ["owner", "admin", "reviewer"].includes(session.user.role))} onProviderChange={setProviderId} onModelChange={setModel} onPromptChange={setPrompt} onStartRun={startRun} onApproveRun={approveRun} />
+      {view === "delivery" ? <DeliveryGovernancePanel session={session} projects={projects} onError={setError} /> : view !== "builder" ? <GovernancePanel mode={view} session={session} projects={projects} onError={setError} /> : !activeProject ? <EmptyProject onCreate={() => setCreateOpen(true)} /> : activeProject.archivedAt || activeProject.deletedAt ? <LifecycleProject project={activeProject} onRestore={() => projectAction("restore")} onPurge={() => projectAction("purge")} /> : <section className="mainGrid">
+        <ChatPanel prompt={prompt} run={activeRun} providers={providerOptions} providerId={providerId} model={model} branches={delivery?.branches ?? [activeProject.activeBranch]} workers={delivery?.workers ?? []} targetBranch={targetBranch} workerId={workerId} canApprove={Boolean(activeRun?.status === "waiting_approval" && activeRun.userId !== session.user.userId && ["owner", "admin", "reviewer"].includes(session.user.role))} onProviderChange={setProviderId} onModelChange={setModel} onTargetBranchChange={setTargetBranch} onWorkerChange={setWorkerId} onPromptChange={setPrompt} onStartRun={startRun} onApproveRun={approveRun} />
         <PreviewPanel project={activeProject} run={activeRun} viewport={viewport} onViewportChange={setViewport} onLog={() => void refreshProject()} />
-        <RightPanel activeTab={tab} onChangeTab={setTab} run={activeRun} policy={policy} usage={usage} logs={logs} resources={resources} metricScopes={metricScopes} metricScopeKey={metricScopeKey} onMetricScopeChange={setMetricScopeKey} deployments={deployments} project={activeProject} currentUserId={session.user.userId} role={session.user.role} onDeploy={createDeployment} onApproveDeployment={approveDeployment} onSaveResource={saveResource} onProvisionDatabase={provisionDatabase} onRemoveResource={removeResource} onError={setError} />
+        <RightPanel activeTab={tab} onChangeTab={setTab} run={activeRun} policy={policy} usage={usage} logs={logs} resources={resources} metricScopes={metricScopes} metricScopeKey={metricScopeKey} onMetricScopeChange={setMetricScopeKey} deployments={deployments} delivery={delivery} project={activeProject} currentUserId={session.user.userId} role={session.user.role} onDeploy={createDeployment} onApproveDeployment={approveDeployment} onDeploymentAction={deploymentAction} onRefresh={refreshProject} onProjectAction={projectAction} onSaveResource={saveResource} onProvisionDatabase={provisionDatabase} onRemoveResource={removeResource} onError={setError} />
       </section>}
     </section>
   </main>;
 }
 
-function ChatPanel({ prompt, run, providers, providerId, model, canApprove, onProviderChange, onModelChange, onPromptChange, onStartRun, onApproveRun }: { prompt: string; run?: Run; providers: ProviderOption[]; providerId: string; model: string; canApprove: boolean; onProviderChange: (value: string) => void; onModelChange: (value: string) => void; onPromptChange: (value: string) => void; onStartRun: () => void; onApproveRun: () => void }) {
+function ChatPanel({ prompt, run, providers, providerId, model, branches, workers, targetBranch, workerId, canApprove, onProviderChange, onModelChange, onTargetBranchChange, onWorkerChange, onPromptChange, onStartRun, onApproveRun }: { prompt: string; run?: Run; providers: ProviderOption[]; providerId: string; model: string; branches: string[]; workers: ProjectWorker[]; targetBranch: string; workerId: string; canApprove: boolean; onProviderChange: (value: string) => void; onModelChange: (value: string) => void; onTargetBranchChange: (value: string) => void; onWorkerChange: (value: string) => void; onPromptChange: (value: string) => void; onStartRun: () => void; onApproveRun: () => void }) {
   const provider = providers.find((item) => item.id === providerId);
   const working = Boolean(run && !["ready", "failed"].includes(run.status));
   const progress = run && ["ready", "failed"].includes(run.status) ? 100 : run?.progress ?? 0;
@@ -250,7 +279,7 @@ function ChatPanel({ prompt, run, providers, providerId, model, canApprove, onPr
   return <section className="panel chatPanel"><div className="panelHeader"><div className="panelTitle"><MessageSquare size={18} />Agent</div>{run && <StatusPill label={run.status.replaceAll("_", " ")} tone={run.status === "failed" ? "amber" : "blue"} />}</div>
     {run && <div className={`runProgress ${working ? "working" : ""}`}><div className="runProgressHeading"><span>{working && <LoaderCircle size={15} />}{run.stageMessage || run.status}</span><strong>{working ? formatElapsed(elapsed) : `${progress}%`}</strong></div><progress value={progress} max="100" /><div className="stageRail">{stages.map((stage) => <span className={stageState(stage, currentStage)} key={stage}><i />{stage}</span>)}</div></div>}
     <div className="messageStream">{run ? <><div className="message userMessage"><span className="avatar">YOU</span><p>{run.prompt}</p></div><div className="message agentMessage"><span className="agentAvatar"><Bot size={16} /></span><div><strong>Build activity</strong><ol className="eventTimeline">{run.events.map((event) => <li className={event.type} key={event.sequence}><span>{event.message}</span><time>{new Date(event.createdAt).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })}</time></li>)}</ol></div></div></> : <div className="emptyRun"><Bot size={24} /><p>Describe the app or change you want to build.</p></div>}</div>
-    <div className="composer"><div className="providerControls"><label className="selectShell"><select aria-label="AI provider" value={providerId} onChange={(event) => onProviderChange(event.target.value)}>{providers.map((item) => <option value={item.id} key={item.id}>{item.name}</option>)}</select><ChevronDown size={16} /></label><label className="selectShell"><select aria-label="AI model" value={model} onChange={(event) => onModelChange(event.target.value)}>{provider?.allowedModels.map((item) => <option value={item} key={item}>{item}</option>)}</select><ChevronDown size={16} /></label></div><textarea value={prompt} onChange={(event) => onPromptChange(event.target.value)} rows={4} placeholder="Build an account dashboard with..." />{canApprove && <button className="primaryButton" onClick={onApproveRun}><ShieldCheck size={17} />Approve run</button>}<button className="primaryButton" onClick={onStartRun} disabled={!prompt.trim() || working || !providerId || !model}>{working ? <LoaderCircle className="spin" size={17} /> : <Play size={17} />}{working ? "Building" : "Run agent"}</button></div>
+    <div className="composer"><div className="providerControls"><label className="selectShell"><select aria-label="AI provider" value={providerId} onChange={(event) => onProviderChange(event.target.value)}>{providers.map((item) => <option value={item.id} key={item.id}>{item.name}</option>)}</select><ChevronDown size={16} /></label><label className="selectShell"><select aria-label="AI model" value={model} onChange={(event) => onModelChange(event.target.value)}>{provider?.allowedModels.map((item) => <option value={item} key={item}>{item}</option>)}</select><ChevronDown size={16} /></label></div><div className="providerControls"><label className="selectShell"><select aria-label="Git branch" value={targetBranch} disabled={Boolean(workerId)} onChange={(event) => onTargetBranchChange(event.target.value)}>{branches.map((branch) => <option value={branch} key={branch}>{branch}</option>)}</select><GitBranch size={15} /></label><label className="selectShell"><select aria-label="Git worker" value={workerId} onChange={(event) => onWorkerChange(event.target.value)}><option value="">Direct branch</option>{workers.filter((worker) => worker.status === "active").map((worker) => <option value={worker.id} key={worker.id}>{worker.name}: {worker.workingBranch}</option>)}</select><ChevronDown size={16} /></label></div><textarea value={prompt} onChange={(event) => onPromptChange(event.target.value)} rows={4} placeholder="Build an account dashboard with..." />{canApprove && <button className="primaryButton" onClick={onApproveRun}><ShieldCheck size={17} />Approve run</button>}<button className="primaryButton" onClick={onStartRun} disabled={!prompt.trim() || working || !providerId || !model}>{working ? <LoaderCircle className="spin" size={17} /> : <Play size={17} />}{working ? "Building" : `Run on ${workers.find((worker) => worker.id === workerId)?.workingBranch ?? targetBranch}`}</button></div>
   </section>;
 }
 
@@ -272,20 +301,34 @@ function PreviewPanel({ project, run, viewport, onViewportChange, onLog }: { pro
   </section>;
 }
 
-function RightPanel({ activeTab, onChangeTab, run, policy, usage, logs, resources, metricScopes, metricScopeKey, onMetricScopeChange, deployments, project, currentUserId, role, onDeploy, onApproveDeployment, onSaveResource, onProvisionDatabase, onRemoveResource, onError }: { activeTab: RightPanelTab; onChangeTab: (tab: RightPanelTab) => void; run?: Run; policy: EffectiveAiPolicy | null; usage: UsageRow[]; logs: RuntimeLog[]; resources: ProjectResource[]; metricScopes: MetricScope[]; metricScopeKey: string; onMetricScopeChange: (value: string) => void; deployments: Deployment[]; project: Project; currentUserId: string; role: Role; onDeploy: (environment: "staging" | "production") => Promise<void>; onApproveDeployment: (id: string) => Promise<void>; onSaveResource: (input: Record<string, unknown>) => Promise<void>; onProvisionDatabase: () => Promise<void>; onRemoveResource: (id: string) => Promise<void>; onError: (value: string) => void }) {
+function RightPanel({ activeTab, onChangeTab, run, policy, usage, logs, resources, metricScopes, metricScopeKey, onMetricScopeChange, deployments, delivery, project, currentUserId, role, onDeploy, onApproveDeployment, onDeploymentAction, onRefresh, onProjectAction, onSaveResource, onProvisionDatabase, onRemoveResource, onError }: { activeTab: RightPanelTab; onChangeTab: (tab: RightPanelTab) => void; run?: Run; policy: EffectiveAiPolicy | null; usage: UsageRow[]; logs: RuntimeLog[]; resources: ProjectResource[]; metricScopes: MetricScope[]; metricScopeKey: string; onMetricScopeChange: (value: string) => void; deployments: Deployment[]; delivery: DeliveryState | null; project: Project; currentUserId: string; role: Role; onDeploy: (profileId: string, branch: string) => Promise<void>; onApproveDeployment: (id: string) => Promise<void>; onDeploymentAction: (id: string, action: "execute" | "rollback") => Promise<void>; onRefresh: () => Promise<void>; onProjectAction: (action: "archive" | "restore" | "trash" | "purge", body?: unknown) => Promise<void>; onSaveResource: (input: Record<string, unknown>) => Promise<void>; onProvisionDatabase: () => Promise<void>; onRemoveResource: (id: string) => Promise<void>; onError: (value: string) => void }) {
   const totals = useMemo(() => usage.reduce((sum, item) => ({ tokens: sum.tokens + item.totalTokens, cost: sum.cost + item.estimatedCostUsd, requests: sum.requests + item.requests }), { tokens: 0, cost: 0, requests: 0 }), [usage]);
+  const [deploymentProfileId, setDeploymentProfileId] = useState("");
+  const [deploymentBranch, setDeploymentBranch] = useState(project.activeBranch);
   async function submitResource(event: FormEvent<HTMLFormElement>) {
     event.preventDefault(); const form = event.currentTarget; const data = new FormData(form);
     const kind = String(data.get("kind")); const url = String(data.get("url") ?? "");
     try { await onSaveResource({ kind, name: String(data.get("name")).trim().toUpperCase(), environment: data.get("environment"), value: data.get("value") || undefined, config: url ? { [kind === "git" ? "repositoryUrl" : "url"]: url } : {} }); form.reset(); }
     catch (error) { onError(error instanceof Error ? error.message : "Resource update failed"); }
   }
-  return <section className="panel detailsPanel"><div className="tabbar"><TabButton icon={<FileCode2 size={16} />} label="Files" tab="files" active={activeTab} set={onChangeTab} /><TabButton icon={<ScrollText size={16} />} label="Logs" tab="logs" active={activeTab} set={onChangeTab} /><TabButton icon={<Plug size={16} />} label="Resources" tab="resources" active={activeTab} set={onChangeTab} /><TabButton icon={<Gauge size={16} />} label="Metrics" tab="metrics" active={activeTab} set={onChangeTab} /><TabButton icon={<Rocket size={16} />} label="Deploy" tab="deploy" active={activeTab} set={onChangeTab} /></div>
+  async function submitGit(event: FormEvent<HTMLFormElement>) {
+    event.preventDefault(); const data = new FormData(event.currentTarget);
+    try { await api(`/api/projects/${project.id}/git`, { method: "PUT", body: JSON.stringify({ repositoryUrl: data.get("repositoryUrl"), defaultBranch: data.get("defaultBranch"), branchPrefix: data.get("branchPrefix"), syncMode: data.get("syncMode"), credentialType: data.get("credentialType"), credential: data.get("credential") || undefined, enabled: true }) }); await onRefresh(); }
+    catch (error) { onError(error instanceof Error ? error.message : "Git configuration failed"); }
+  }
+  async function submitWorker(event: FormEvent<HTMLFormElement>) {
+    event.preventDefault(); const form = event.currentTarget; const data = new FormData(form);
+    try { await api(`/api/projects/${project.id}/workers`, { method: "POST", body: JSON.stringify({ name: data.get("name"), baseBranch: data.get("baseBranch"), workingBranch: data.get("workingBranch"), autoPush: data.get("autoPush") === "on" }) }); form.reset(); await onRefresh(); }
+    catch (error) { onError(error instanceof Error ? error.message : "Worker creation failed"); }
+  }
+  const selectedDeploymentProfile = deploymentProfileId || delivery?.deploymentProfiles[0]?.id || "";
+  return <section className="panel detailsPanel"><div className="tabbar"><TabButton icon={<FileCode2 size={16} />} label="Files" tab="files" active={activeTab} set={onChangeTab} /><TabButton icon={<ScrollText size={16} />} label="Logs" tab="logs" active={activeTab} set={onChangeTab} /><TabButton icon={<Plug size={16} />} label="Resources" tab="resources" active={activeTab} set={onChangeTab} /><TabButton icon={<GitBranch size={16} />} label="Git" tab="git" active={activeTab} set={onChangeTab} /><TabButton icon={<Gauge size={16} />} label="Metrics" tab="metrics" active={activeTab} set={onChangeTab} /><TabButton icon={<Rocket size={16} />} label="Deploy" tab="deploy" active={activeTab} set={onChangeTab} /></div>
     {activeTab === "files" && <div className="tabContent"><div className="infoRow"><span>Run</span><strong><GitBranch size={14} />{run?.commitSha?.slice(0, 8) ?? run?.id.slice(0, 8) ?? "No run"}</strong></div><div className="fileList">{run?.files.length ? run.files.map((file) => <article className="fileItem" key={file.path}><div><strong>{file.path}</strong><p>{file.summary}</p></div><span>+{file.additions} -{file.deletions}</span></article>) : <p className="mutedText">Changed files appear after a run completes.</p>}</div></div>}
     {activeTab === "logs" && <div className="tabContent"><div className="infoRow"><span>Runtime and verification</span><strong>{logs.length}</strong></div><div className="logList">{logs.length ? logs.map((log) => <article className={`logItem ${log.level}`} key={log.id}><div><span>{log.source}</span><time>{new Date(log.createdAt).toLocaleTimeString()}</time></div><p>{log.message}</p></article>) : <p className="mutedText">Logs will appear as the preview and verification run.</p>}</div></div>}
     {activeTab === "resources" && <div className="tabContent"><button className="secondaryButton" onClick={() => void onProvisionDatabase().catch((error) => onError(error instanceof Error ? error.message : "Database provisioning failed"))}><Database size={16} />Provision PostgreSQL</button><div className="resourceList">{resources.map((resource) => <article className="resourceItem" key={resource.id}><span className="resourceIcon">{resource.kind === "database" ? <Database size={16} /> : <KeyRound size={16} />}</span><div><strong>{resource.name}</strong><small>{resource.kind} · {resource.environment}</small></div><button className="miniIcon" title={`Delete ${resource.name}`} onClick={() => void onRemoveResource(resource.id).catch((error) => onError(error instanceof Error ? error.message : "Resource deletion failed"))}><Trash2 size={15} /></button></article>)}</div><form className="resourceForm" onSubmit={(event) => void submitResource(event)}><label>Kind<select name="kind"><option value="secret">Secret</option><option value="api">API key</option><option value="smtp">SMTP</option><option value="git">Git repository</option><option value="service">Service</option></select></label><label>Environment variable<input name="name" pattern="[A-Z][A-Z0-9_]*" placeholder="SERVICE_API_KEY" required /></label><label>Environment<select name="environment"><option value="development">Development</option><option value="staging">Staging</option><option value="production">Production</option><option value="all">All</option></select></label><label>Secret value<input name="value" type="password" autoComplete="off" /></label><label className="wideField">Service or repository URL<input name="url" type="url" placeholder="https://..." /></label><button className="primaryButton"><Plus size={16} />Save resource</button></form></div>}
+    {activeTab === "git" && <div className="tabContent"><div className="infoRow"><span>Active branch</span><strong><GitBranch size={14} />{delivery?.activeBranch ?? project.activeBranch}</strong></div><label className="fieldLabel">Stack profile<select value={delivery?.stackProfileId ?? ""} onChange={(event) => void api(`/api/projects/${project.id}/stack-profile`, { method: "POST", body: JSON.stringify({ profileId: event.target.value || null }) }).then(onRefresh).catch(showError(onError))}><option value="">Inherited default</option>{delivery?.stackProfiles.map((profile) => <option key={profile.id} value={profile.id}>{profile.name} ({profile.scopeType})</option>)}</select></label><form className="resourceForm" onSubmit={(event) => void submitGit(event)}><label className="wideField">HTTPS repository<input name="repositoryUrl" type="url" defaultValue={delivery?.git?.repositoryUrl} required /></label><label>Default branch<input name="defaultBranch" defaultValue={delivery?.git?.defaultBranch ?? "main"} required /></label><label>Agent branch prefix<input name="branchPrefix" defaultValue={delivery?.git?.branchPrefix ?? "vibeable/"} /></label><label>Sync mode<select name="syncMode" defaultValue={delivery?.git?.syncMode ?? "mirror"}><option value="mirror">Mirror branches</option><option value="source">Source branch only</option></select></label><label>Credential type<select name="credentialType" defaultValue={delivery?.git?.credentialType ?? "bearer"}><option value="bearer">Bearer token</option><option value="basic">username:token</option></select></label><label className="wideField">Credential<input name="credential" type="password" autoComplete="off" placeholder={delivery?.git?.hasCredential ? "Leave blank to retain" : "Optional"} /></label><button className="primaryButton"><UploadCloud size={16} />Save Git</button></form>{delivery?.git && <div className="deployActions"><button className="secondaryButton" onClick={() => void api(`/api/projects/${project.id}/git/sync`, { method: "POST", body: JSON.stringify({ direction: "pull", branch: delivery.activeBranch }) }).then(onRefresh).catch(showError(onError))}><RotateCcw size={16} />Pull</button><button className="secondaryButton" onClick={() => void api(`/api/projects/${project.id}/git/sync`, { method: "POST", body: JSON.stringify({ direction: "push", branch: delivery.activeBranch }) }).then(onRefresh).catch(showError(onError))}><UploadCloud size={16} />Push</button></div>}<div className="sectionTitle">Branch workers</div><div className="resourceList">{delivery?.workers.map((worker) => <article className="resourceItem" key={worker.id}><span className="resourceIcon"><GitBranch size={16} /></span><div><strong>{worker.name}</strong><small>{worker.workingBranch} · {worker.status} · {worker.autoPush ? "auto-push" : "local"}</small></div>{worker.status === "active" && <button className="miniIcon" title="Stop worker" onClick={() => void api(`/api/projects/${project.id}/workers/${worker.id}`, { method: "DELETE" }).then(onRefresh).catch(showError(onError))}><X size={15} /></button>}</article>)}</div><form className="resourceForm" onSubmit={(event) => void submitWorker(event)}><label>Name<input name="name" placeholder="Checkout redesign" required /></label><label>Base branch<select name="baseBranch" defaultValue={delivery?.activeBranch}>{delivery?.branches.map((branch) => <option key={branch}>{branch}</option>)}</select></label><label className="wideField">Working branch<input name="workingBranch" placeholder="feature/checkout-redesign" required /></label><label className="checkboxLabel"><input name="autoPush" type="checkbox" defaultChecked />Auto-push</label><button className="primaryButton"><Plus size={16} />Spawn worker</button></form>{delivery && delivery.branches.length > 1 && <form className="resourceForm" onSubmit={(event) => { event.preventDefault(); const data = new FormData(event.currentTarget); void api(`/api/projects/${project.id}/branches/promote`, { method: "POST", body: JSON.stringify({ branch: data.get("branch"), destination: data.get("destination"), push: true }) }).then(onRefresh).catch(showError(onError)); }}><label>Promote<select name="branch">{delivery.branches.filter((branch) => branch !== delivery.activeBranch).map((branch) => <option key={branch}>{branch}</option>)}</select></label><label>Into<select name="destination" defaultValue={delivery.activeBranch}>{delivery.branches.map((branch) => <option key={branch}>{branch}</option>)}</select></label><button className="secondaryButton"><GitBranch size={16} />Promote branch</button></form>}<div className="dangerZone"><button className="secondaryButton" onClick={() => void onProjectAction("archive", { offload: false }).catch(showError(onError))}><Archive size={16} />Archive</button><button className="secondaryButton" disabled={!delivery?.git} onClick={() => void onProjectAction("archive", { offload: true }).catch(showError(onError))}><UploadCloud size={16} />Offload to Git</button><button className="dangerButton" onClick={() => window.confirm(`Move ${project.name} to trash?`) && void onProjectAction("trash").catch(showError(onError))}><Trash2 size={16} />Move to trash</button></div></div>}
     {activeTab === "metrics" && <div className="tabContent"><label className="selectShell fullWidth"><select aria-label="Usage scope" value={metricScopeKey} onChange={(event) => onMetricScopeChange(event.target.value)}>{metricScopes.map((scope) => <option key={`${scope.scope}:${scope.id}`} value={`${scope.scope}:${scope.id}`}>{scope.scope}: {scope.label}</option>)}</select><ChevronDown size={16} /></label><MetricTile icon={<CircleDollarSign size={18} />} label="Usage" value={formatTokens(totals.tokens)} detail={`$${totals.cost.toFixed(2)} across ${totals.requests} requests`} />{policy && <MetricTile icon={<ShieldCheck size={18} />} label="Boundary" value={formatTokens(policy.monthlyTokenLimit)} detail={`$${policy.monthlyCostLimitUsd.toLocaleString()} monthly cap`} />}<UsageBars values={usage} /></div>}
-    {activeTab === "deploy" && <div className="tabContent"><MetricTile icon={<Cloud size={18} />} label="Environment" value={project.environment} detail="Approval-gated deployment record" /><div className="checkList">{deployments.map((deployment) => <div className="checkItem" key={deployment.id}><span className={`checkIcon ${deployment.status === "approved" ? "passed" : "pending"}`}>{deployment.status === "approved" && <Check size={14} />}</span><div><strong>{deployment.environment}</strong><small>{deployment.status}</small></div>{deployment.status === "waiting_approval" && deployment.requestedBy !== currentUserId && ["owner", "admin", "reviewer"].includes(role) && <button className="miniIcon" title="Approve deployment" onClick={() => void onApproveDeployment(deployment.id)}><ShieldCheck size={15} /></button>}</div>)}</div><button className="primaryButton" onClick={() => void onDeploy("staging")}><Rocket size={16} />Create staging record</button><button className="secondaryButton" onClick={() => void onDeploy("production")}><ShieldCheck size={16} />Request production</button></div>}
+    {activeTab === "deploy" && <div className="tabContent"><MetricTile icon={<Cloud size={18} />} label="Environment" value={project.environment} detail="Exact-commit, profile-driven delivery" />{delivery?.deploymentProfiles.length ? <div className="deployComposer"><label className="fieldLabel">Deployment profile<select value={selectedDeploymentProfile} onChange={(event) => setDeploymentProfileId(event.target.value)}>{delivery.deploymentProfiles.map((profile) => <option value={profile.id} key={profile.id}>{profile.name} · {profile.adapter} · {profile.environment}</option>)}</select></label><label className="fieldLabel">Branch<select value={deploymentBranch} onChange={(event) => setDeploymentBranch(event.target.value)}>{delivery.branches.map((branch) => <option key={branch}>{branch}</option>)}</select></label><button className="primaryButton" onClick={() => void onDeploy(selectedDeploymentProfile, deploymentBranch)}><Rocket size={16} />Plan deployment</button></div> : <p className="mutedText">An administrator must create a deployment profile for this team or project.</p>}<div className="checkList">{deployments.map((deployment) => <article className="deploymentItem" key={deployment.id}><div className="deploymentHeading"><span className={`checkIcon ${deployment.status === "deployed" ? "passed" : "pending"}`}>{deployment.status === "deployed" && <Check size={14} />}</span><div><strong>{deployment.profileName ?? deployment.environment}</strong><small>{deployment.adapter} · {deployment.branch} · {deployment.status}</small></div></div><div className="deploymentEvents">{deployment.events?.map((event) => <p className={event.level} key={event.id}><span>{event.type}</span>{event.message}</p>)}</div><div className="deployActions">{deployment.status === "waiting_approval" && deployment.requestedBy !== currentUserId && ["owner", "admin", "reviewer"].includes(role) && <button className="secondaryButton" onClick={() => void onApproveDeployment(deployment.id)}><ShieldCheck size={15} />Approve</button>}{deployment.status === "approved" && ["owner", "admin", "developer"].includes(role) && <button className="primaryButton" onClick={() => void onDeploymentAction(deployment.id, "execute").catch(showError(onError))}><Play size={15} />Execute</button>}{deployment.status === "deployed" && ["owner", "admin", "developer"].includes(role) && <button className="secondaryButton" onClick={() => void onDeploymentAction(deployment.id, "rollback").catch(showError(onError))}><RotateCcw size={15} />Rollback</button>}</div></article>)}</div></div>}
   </section>;
 }
 
@@ -294,6 +337,21 @@ interface TeamSetting { id: string; name: string; slug: string; memberCount: num
 interface UserSetting { id: string; name: string; email: string; role: Role; teams: Array<{ id: string; name: string; role: Role }> }
 interface PolicySetting { id: string; scope_type: string; scope_id: string; default_model: string; monthly_token_limit: string; monthly_cost_limit_usd: string }
 interface HookSetting { id: string; scope_type: string; phase: string; title: string; priority: number }
+interface StackProfileSetting { id: string; scopeType: "global" | "team" | "project"; scopeId: string; name: string; description: string; rules: Record<string, string[]>; isDefault: boolean; enabled: boolean }
+interface DeploymentProfileSetting { id: string; scopeType: "team" | "project"; scopeId: string; name: string; adapter: string; environment: string; config: Record<string, unknown>; resourceNames: string[]; enabled: boolean }
+type DeliveryAdapter = "kubernetes" | "helm" | "docker_swarm" | "compose" | "gitops" | "webhook";
+
+function defaultDeploymentConfig(adapter: DeliveryAdapter) {
+  const defaults: Record<DeliveryAdapter, Record<string, string>> = {
+    kubernetes: { manifestPath: "deploy/kubernetes.yaml" },
+    helm: { chartPath: "deploy/chart", release: "app", namespace: "default" },
+    docker_swarm: { composePath: "compose.yaml", stack: "app" },
+    compose: { composePath: "compose.yaml", projectName: "app" },
+    gitops: { branch: "main" },
+    webhook: { url: "https://deploy.example.com/hooks/vibeable" }
+  };
+  return JSON.stringify(defaults[adapter], null, 2);
+}
 
 function GovernancePanel({ mode, session, projects, onError }: { mode: "teams" | "policy"; session: Session; projects: Project[]; onError: (value: string) => void }) {
   const [providers, setProviders] = useState<ProviderSetting[]>([]);
@@ -359,6 +417,39 @@ function GovernancePanel({ mode, session, projects, onError }: { mode: "teams" |
       <form className="settingsForm" onSubmit={(event) => void submit("/api/admin/hooks", event, (data) => ({ scopeType: data.get("scopeType"), scopeId: data.get("scopeId"), phase: data.get("phase"), priority: Number(data.get("priority")), mandatory: data.get("mandatory") === "on", title: data.get("title"), prompt: data.get("prompt") }))}><label>Scope<select name="scopeType" value={hookScope} onChange={(event) => setHookScope(event.target.value as typeof hookScope)}><option value="global">Global</option>{session.teams[0] && <option value="team">Team</option>}</select></label><label>Target<select name="scopeId">{hookScope === "global" ? <option value={session.user.organizationId}>{session.user.organizationName}</option> : session.teams.map((team) => <option value={team.id} key={team.id}>{team.name}</option>)}</select></label><label>Phase<select name="phase">{phases.map((item) => <option key={item}>{item}</option>)}</select></label><label>Title<input name="title" required /></label><label>Priority<input name="priority" type="number" defaultValue="0" required /></label><label className="wideField">Prompt<textarea name="prompt" rows={3} required /></label><label className="checkboxLabel"><input name="mandatory" type="checkbox" />Mandatory</label><button className="primaryButton"><Plus size={16} />Add hook</button></form>
     </section>
   </section>;
+}
+
+function DeliveryGovernancePanel({ session, projects, onError }: { session: Session; projects: Project[]; onError: (value: string) => void }) {
+  const [teams, setTeams] = useState<TeamSetting[]>([]);
+  const [stacks, setStacks] = useState<StackProfileSetting[]>([]);
+  const [profiles, setProfiles] = useState<DeploymentProfileSetting[]>([]);
+  const [stackScope, setStackScope] = useState<"global" | "team" | "project">("team");
+  const [deployScope, setDeployScope] = useState<"team" | "project">("team");
+  const [deployAdapter, setDeployAdapter] = useState<DeliveryAdapter>("kubernetes");
+  const [deployConfig, setDeployConfig] = useState(defaultDeploymentConfig("kubernetes"));
+  const [revision, setRevision] = useState(0);
+  useEffect(() => { void Promise.all([
+    api<{ teams: TeamSetting[] }>("/api/admin/teams"),
+    api<{ profiles: StackProfileSetting[] }>("/api/admin/stack-profiles"),
+    api<{ profiles: DeploymentProfileSetting[] }>("/api/admin/deployment-profiles")
+  ]).then(([teamResult, stackResult, profileResult]) => { setTeams(teamResult.teams); setStacks(stackResult.profiles); setProfiles(profileResult.profiles); }).catch(showError(onError)); }, [onError, revision]);
+  const stackTargets = stackScope === "global" ? [{ id: session.user.organizationId, name: session.user.organizationName }] : stackScope === "team" ? teams : projects;
+  const deployTargets = deployScope === "team" ? teams : projects;
+  async function submitStack(event: FormEvent<HTMLFormElement>) {
+    event.preventDefault(); const form = event.currentTarget; const data = new FormData(form); const list = (name: string) => String(data.get(name) ?? "").split(",").map((value) => value.trim()).filter(Boolean);
+    try { await api("/api/admin/stack-profiles", { method: "POST", body: JSON.stringify({ scopeType: data.get("scopeType"), scopeId: data.get("scopeId"), name: data.get("name"), description: data.get("description"), isDefault: data.get("isDefault") === "on", enabled: true, rules: { allowedLanguages: list("allowedLanguages"), allowedFrameworks: list("allowedFrameworks"), allowedPackageManagers: list("allowedPackageManagers"), allowedBaseImages: list("allowedBaseImages"), requiredFiles: list("requiredFiles"), requiredDependencies: list("requiredDependencies"), forbiddenDependencies: list("forbiddenDependencies"), requiredScripts: list("requiredScripts") } }) }); form.reset(); setRevision((value) => value + 1); }
+    catch (error) { onError(error instanceof Error ? error.message : "Stack profile creation failed"); }
+  }
+  async function submitDeploymentProfile(event: FormEvent<HTMLFormElement>) {
+    event.preventDefault(); const form = event.currentTarget; const data = new FormData(form);
+    try { const config = JSON.parse(String(data.get("config") || "{}")); await api("/api/admin/deployment-profiles", { method: "POST", body: JSON.stringify({ scopeType: data.get("scopeType"), scopeId: data.get("scopeId"), name: data.get("name"), adapter: data.get("adapter"), environment: data.get("environment"), config, resourceNames: String(data.get("resourceNames") ?? "").split(",").map((value) => value.trim()).filter(Boolean), enabled: true }) }); form.reset(); setDeployAdapter("kubernetes"); setDeployConfig(defaultDeploymentConfig("kubernetes")); setRevision((value) => value + 1); }
+    catch (error) { onError(error instanceof Error ? error.message : "Deployment profile creation failed"); }
+  }
+  return <section className="governancePanel"><section className="settingsSection"><div className="settingsHeading"><div><h2>Enforced technology profiles</h2><p>Generation is prompted with these constraints and the workspace is rejected when validation fails.</p></div></div><div className="settingsTable">{stacks.map((profile) => <div className="settingsRow" key={profile.id}><span className="settingIcon"><Code2 size={17} /></span><div><strong>{profile.name}</strong><small>{profile.scopeType} · {profile.description || "No description"}</small></div><span>{profile.isDefault ? "default" : "selectable"}</span></div>)}</div><form className="settingsForm" onSubmit={(event) => void submitStack(event)}><label>Scope<select name="scopeType" value={stackScope} onChange={(event) => setStackScope(event.target.value as typeof stackScope)}><option value="global">Global</option><option value="team">Team</option><option value="project">Project</option></select></label><label>Target<select name="scopeId">{stackTargets.map((target) => <option key={target.id} value={target.id}>{target.name}</option>)}</select></label><label>Name<input name="name" required /></label><label>Description<input name="description" /></label><label>Languages<input name="allowedLanguages" placeholder="typescript, go" /></label><label>Frameworks<input name="allowedFrameworks" placeholder="react, fastify" /></label><label>Package managers<input name="allowedPackageManagers" placeholder="pnpm" /></label><label>Base images<input name="allowedBaseImages" placeholder="node, nginx" /></label><label>Required files<input name="requiredFiles" placeholder="Dockerfile, README.md" /></label><label>Required dependencies<input name="requiredDependencies" placeholder="fastify" /></label><label>Forbidden dependencies<input name="forbiddenDependencies" placeholder="left-pad" /></label><label>Required scripts<input name="requiredScripts" placeholder="build, test" /></label><label className="checkboxLabel"><input name="isDefault" type="checkbox" />Default for scope</label><button className="primaryButton"><Plus size={16} />Add stack profile</button></form></section><section className="settingsSection"><div className="settingsHeading"><div><h2>Deployment profiles</h2><p>Fixed adapters support Kubernetes, Helm, Docker Swarm, Compose, GitOps, and authenticated webhooks.</p></div></div><div className="settingsTable">{profiles.map((profile) => <div className="settingsRow" key={profile.id}><span className="settingIcon"><Rocket size={17} /></span><div><strong>{profile.name}</strong><small>{profile.scopeType} · {profile.adapter}</small></div><StatusPill label={profile.environment} tone={profile.environment === "production" ? "amber" : "blue"} /></div>)}</div><form className="settingsForm" onSubmit={(event) => void submitDeploymentProfile(event)}><label>Scope<select name="scopeType" value={deployScope} onChange={(event) => setDeployScope(event.target.value as typeof deployScope)}><option value="team">Team</option><option value="project">Project</option></select></label><label>Target<select name="scopeId">{deployTargets.map((target) => <option key={target.id} value={target.id}>{target.name}</option>)}</select></label><label>Name<input name="name" required /></label><label>Adapter<select name="adapter" value={deployAdapter} onChange={(event) => { const adapter = event.target.value as DeliveryAdapter; setDeployAdapter(adapter); setDeployConfig(defaultDeploymentConfig(adapter)); }}><option value="kubernetes">Kubernetes</option><option value="helm">Helm</option><option value="docker_swarm">Docker Swarm</option><option value="compose">Docker Compose</option><option value="gitops">GitOps</option><option value="webhook">Webhook</option></select></label><label>Environment<select name="environment"><option value="staging">Staging</option><option value="production">Production</option></select></label><label className="wideField">Adapter config (JSON)<textarea name="config" rows={4} value={deployConfig} onChange={(event) => setDeployConfig(event.target.value)} required /></label><label className="wideField">Injected resource names<input name="resourceNames" placeholder="DATABASE_URL, SMTP_PASSWORD" /></label><button className="primaryButton"><Plus size={16} />Add deployment profile</button></form></section></section>;
+}
+
+function LifecycleProject({ project, onRestore, onPurge }: { project: Project; onRestore: () => Promise<void>; onPurge: () => Promise<void> }) {
+  return <section className="emptyProject"><Archive size={32} /><h2>{project.deletedAt ? "Project is in trash" : project.offloadedAt ? "Project is offloaded to Git" : "Project is archived"}</h2><p className="mutedText">{project.deletedAt ? "Restore it to continue or permanently purge its database records and workspace." : "Restore it to resume builds, previews, and deployments."}</p><div className="deployActions"><button className="primaryButton" onClick={() => void onRestore()}><RotateCcw size={17} />Restore project</button>{project.deletedAt && <button className="dangerButton" onClick={() => window.confirm(`Permanently purge ${project.name}? This cannot be undone.`) && void onPurge()}><Trash2 size={17} />Purge permanently</button>}</div></section>;
 }
 
 function ServiceUnavailable({ message, retry }: { message: string; retry: () => Promise<void> }) {

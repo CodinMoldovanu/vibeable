@@ -1,5 +1,5 @@
 import { execFile } from "node:child_process";
-import { lstat, mkdir, readFile, readdir, realpath, stat, writeFile } from "node:fs/promises";
+import { lstat, mkdir, readFile, readdir, realpath, rm, stat, writeFile } from "node:fs/promises";
 import { join, relative, resolve, sep } from "node:path";
 import { promisify } from "node:util";
 import { config } from "./config.js";
@@ -34,7 +34,7 @@ export async function ensureWorkspace(projectId: string, projectName: string) {
   return directory;
 }
 
-export async function prepareRunBranch(directory: string, runId: string) {
+export async function prepareRunBranch(directory: string, runId: string, targetBranch = "main", branchPrefix = "") {
   await initializeRepository(directory);
   const currentBranch = (await git(directory, ["branch", "--show-current"])).stdout.trim();
   const status = await git(directory, ["status", "--porcelain"]);
@@ -42,13 +42,19 @@ export async function prepareRunBranch(directory: string, runId: string) {
     await git(directory, ["add", "-A"]);
     await git(directory, ["commit", "-m", "Checkpoint workspace before agent run"]);
   }
-  if (currentBranch !== "main") {
+  const targetExists = await git(directory, ["show-ref", "--verify", "--quiet", `refs/heads/${targetBranch}`]).then(() => true).catch(() => false);
+  if (targetBranch === "main" && currentBranch.startsWith("agent/") && currentBranch !== "main") {
     await git(directory, ["checkout", "main"]);
     await git(directory, ["merge", "--ff-only", currentBranch]);
+  } else if (targetExists) {
+    await git(directory, ["checkout", targetBranch]);
   } else {
     await git(directory, ["checkout", "main"]);
+    if (targetBranch !== "main") await git(directory, ["checkout", "-b", targetBranch]);
   }
-  await git(directory, ["checkout", "-B", `agent/${runId}`]);
+  const runBranch = `${branchPrefix}agent/${runId}`;
+  await git(directory, ["checkout", "-B", runBranch]);
+  return runBranch;
 }
 
 export async function commitRun(directory: string, input: { runId: string; userId: string; providerId: string; model: string; totalTokens: number }) {
@@ -64,15 +70,51 @@ export async function commitRun(directory: string, input: { runId: string; userI
   return (await git(directory, ["rev-parse", "HEAD"])).stdout.trim();
 }
 
-export async function finalizeRunBranch(directory: string, runId: string) {
-  await git(directory, ["checkout", "main"]);
-  await git(directory, ["merge", "--ff-only", `agent/${runId}`]);
+export async function finalizeRunBranch(directory: string, runBranch: string, targetBranch = "main") {
+  await git(directory, ["checkout", targetBranch]);
+  await git(directory, ["merge", "--ff-only", runBranch]);
 }
 
-export async function abortRunBranch(directory: string, runId: string) {
+export async function abortRunBranch(directory: string, runBranch: string, targetBranch = "main") {
   await git(directory, ["reset", "--hard", "HEAD"]).catch(() => undefined);
-  await git(directory, ["checkout", "main"]).catch(() => undefined);
-  await git(directory, ["branch", "-D", `agent/${runId}`]).catch(() => undefined);
+  await git(directory, ["checkout", targetBranch]).catch(() => undefined);
+  await git(directory, ["branch", "-D", runBranch]).catch(() => undefined);
+}
+
+export async function checkoutProjectBranch(directory: string, branch: string) {
+  await git(directory, ["checkout", branch]);
+}
+
+export async function createProjectBranch(directory: string, branch: string, baseBranch: string, returnBranch = "main") {
+  await initializeRepository(directory);
+  const exists = await git(directory, ["show-ref", "--verify", "--quiet", `refs/heads/${branch}`]).then(() => true).catch(() => false);
+  if (!exists) {
+    await git(directory, ["checkout", baseBranch]);
+    await git(directory, ["checkout", "-b", branch]);
+  }
+  await git(directory, ["checkout", returnBranch]);
+}
+
+export async function promoteProjectBranch(directory: string, branch: string, destination = "main") {
+  await git(directory, ["checkout", destination]);
+  await git(directory, ["merge", "--no-ff", "-m", `Promote ${branch}`, branch]);
+  return (await git(directory, ["rev-parse", "HEAD"])).stdout.trim();
+}
+
+export async function currentCommit(directory: string, branch = "HEAD") {
+  return (await git(directory, ["rev-parse", branch])).stdout.trim();
+}
+
+export async function createDeploymentWorktree(directory: string, deploymentId: string, commitSha: string) {
+  const destination = join(config.DATA_DIR, "deployment-worktrees", deploymentId);
+  await mkdir(join(config.DATA_DIR, "deployment-worktrees"), { recursive: true });
+  await rm(destination, { recursive: true, force: true });
+  await git(directory, ["worktree", "add", "--detach", destination, commitSha]);
+  return destination;
+}
+
+export async function removeDeploymentWorktree(directory: string, destination: string) {
+  await git(directory, ["worktree", "remove", "--force", destination]).catch(() => undefined);
 }
 
 export async function workspaceContext(directory: string) {

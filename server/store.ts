@@ -1,3 +1,4 @@
+import type { PoolClient } from "pg";
 import { query } from "./db.js";
 import type { Principal } from "./permissions.js";
 
@@ -10,6 +11,11 @@ export interface ProjectRow {
   slug: string;
   status: "draft" | "building" | "ready" | "deployed";
   environment: "development" | "staging" | "production";
+  activeBranch: string;
+  stackProfileId: string | null;
+  archivedAt: string | null;
+  deletedAt: string | null;
+  offloadedAt: string | null;
   updatedAt: string;
 }
 
@@ -24,7 +30,9 @@ export async function listMemberTeamIds(principal: Principal) {
 export async function getAccessibleProject(principal: Principal, projectId: string) {
   const result = await query<ProjectRow>(
     `SELECT p.id, p.organization_id AS "organizationId", p.team_id AS "teamId", p.owner_id AS "ownerId",
-            p.name, p.slug, p.status, p.environment, p.updated_at AS "updatedAt"
+            p.name, p.slug, p.status, p.environment, p.active_branch AS "activeBranch",
+            p.stack_profile_id AS "stackProfileId", p.archived_at AS "archivedAt",
+            p.deleted_at AS "deletedAt", p.offloaded_at AS "offloadedAt", p.updated_at AS "updatedAt"
        FROM projects p
       WHERE p.id = $1 AND p.organization_id = $2
         AND ($3::boolean OR EXISTS (
@@ -41,18 +49,24 @@ export async function getAccessibleProject(principal: Principal, projectId: stri
   return project;
 }
 
+export function assertProjectOperational(project: Pick<ProjectRow, "archivedAt" | "deletedAt" | "offloadedAt">) {
+  if (project.deletedAt) throw Object.assign(new Error("Project is in trash; restore it before continuing"), { statusCode: 409 });
+  if (project.archivedAt || project.offloadedAt) throw Object.assign(new Error("Project is archived; restore it before continuing"), { statusCode: 409 });
+}
+
 export async function writeAudit(
   principal: Principal,
   action: string,
   resourceType: string,
   resourceId: string,
   metadata: Record<string, unknown> = {},
-  ipAddress?: string
+  ipAddress?: string,
+  database?: PoolClient
 ) {
-  await query(
-    `INSERT INTO audit_events
+  const statement = `INSERT INTO audit_events
        (organization_id, actor_user_id, action, resource_type, resource_id, metadata, ip_address)
-     VALUES ($1, $2, $3, $4, $5, $6, $7)`,
-    [principal.organizationId, principal.userId, action, resourceType, resourceId, metadata, ipAddress ?? null]
-  );
+     VALUES ($1, $2, $3, $4, $5, $6, $7)`;
+  const values = [principal.organizationId, principal.userId, action, resourceType, resourceId, metadata, ipAddress ?? null];
+  if (database) await database.query(statement, values);
+  else await query(statement, values);
 }

@@ -127,6 +127,27 @@ button {
   color: #7a6672;
 }
 
+.projectFilters {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 3px;
+  padding: 3px;
+  background: #e9eef1;
+  border-radius: 7px;
+}
+
+.projectFilters button {
+  min-width: 0;
+  padding: 6px 4px;
+  color: #64727a;
+  font-size: 11px;
+  background: transparent;
+  border-radius: 5px;
+  cursor: pointer;
+}
+
+.projectFilters button.active { color: #17272f; background: #fff; }
+
 .sideSection {
   display: grid;
   gap: 9px;
@@ -416,6 +437,17 @@ button {
   font-weight: 700;
 }
 
+.fieldLabel select {
+  width: 100%;
+  min-height: 36px;
+  margin-top: 6px;
+  padding: 7px 9px;
+  color: #172027;
+  background: #fff;
+  border: 1px solid #cbd6dc;
+  border-radius: 7px;
+}
+
 .messageStream {
   display: flex;
   flex: 1;
@@ -491,7 +523,8 @@ button {
 }
 
 .primaryButton,
-.secondaryButton {
+.secondaryButton,
+.dangerButton {
   display: inline-flex;
   align-items: center;
   justify-content: center;
@@ -518,6 +551,11 @@ button {
   color: #23323c;
   background: #edf4f4;
   border: 1px solid #bfd2d2;
+}
+
+.dangerButton {
+  color: #fff;
+  background: #a63b49;
 }
 
 .segmented {
@@ -720,7 +758,7 @@ button {
 
 .tabbar {
   display: grid;
-  grid-template-columns: repeat(5, minmax(0, 1fr));
+  grid-template-columns: repeat(6, minmax(0, 1fr));
   gap: 4px;
   padding: 8px;
   border-bottom: 1px solid #e0e7eb;
@@ -831,6 +869,34 @@ button {
 .resourceForm select { width: 100%; min-width: 0; min-height: 36px; padding: 7px 9px; border: 1px solid #cbd6dc; border-radius: 7px; background: #fff; }
 .resourceForm .wideField,
 .resourceForm button { grid-column: 1 / -1; }
+.resourceForm .checkboxLabel { display: flex; align-items: center; flex-direction: row; }
+.resourceForm .checkboxLabel input { width: 16px; min-height: 16px; }
+
+.dangerZone {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 8px;
+  padding-top: 14px;
+  border-top: 1px solid #ead4d8;
+}
+
+.deploymentItem {
+  display: grid;
+  gap: 10px;
+  padding: 11px;
+  border: 1px solid #d9e2e6;
+  border-radius: 8px;
+  background: #f9fbfb;
+}
+
+.deploymentHeading { display: grid; grid-template-columns: 30px minmax(0, 1fr); align-items: center; gap: 9px; }
+.deploymentHeading strong, .deploymentHeading small { display: block; }
+.deploymentHeading small { margin-top: 3px; color: #68777f; font-size: 11px; }
+.deploymentEvents { display: grid; gap: 5px; }
+.deploymentEvents p { margin: 0; color: #4f6069; font-size: 11px; line-height: 1.45; }
+.deploymentEvents p.error { color: #9a3340; }
+.deploymentEvents p span { margin-right: 7px; color: #75838a; font: 10px ui-monospace, SFMono-Regular, Menlo, monospace; text-transform: uppercase; }
+.deployComposer { display: grid; gap: 10px; }
 
 .fileItem,
 .hookItem {
