@@ -5,6 +5,8 @@ Vibeable is a single deployable control plane with a PostgreSQL database and pro
 ```mermaid
 flowchart LR
   Browser["React builder"] -->|session cookie| API["Fastify API"]
+  Browser -->|authorization code + PKCE| IdP["OIDC identity provider"]
+  IdP -->|signed ID token| API
   Browser -->|SSE| Runs["Run event stream"]
   Browser -->|authenticated iframe| Preview["Workspace preview"]
   API --> Auth["Sessions and RBAC"]
@@ -27,6 +29,7 @@ flowchart LR
 ## Trust boundaries
 
 - The browser never receives provider credentials. Sessions are opaque, hashed in PostgreSQL, HttpOnly, SameSite Strict, and Secure in production.
+- OIDC validates discovery issuer, signed ID-token issuer/audience/nonce, one-time hashed state, verified email policy, signing algorithms, and bounded pinned endpoint requests. OIDC claims feed the same persisted RBAC memberships used by local accounts.
 - Every project query includes organization and team access constraints. API handlers enforce permissions before mutations.
 - Provider responses, workspace files, and captured application logs are untrusted. The orchestrator accepts one bounded JSON schema, rejects unsafe paths and symlinks, excludes common credential files from context, and limits file count and size.
 - Preview content is served from an authenticated endpoint in a sandboxed iframe with a restrictive content security policy.

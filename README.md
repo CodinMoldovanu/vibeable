@@ -1,6 +1,6 @@
 # Vibeable
 
-Vibeable is a source-available, self-hosted, policy-aware AI application builder for organizations. It combines a conversational coding workflow and authenticated live preview with teams, RBAC, editable OpenAI-compatible providers, scoped prompt policies, managed project resources, usage accounting, and deployment approvals.
+Vibeable is a source-available, self-hosted, policy-aware AI application builder for organizations. It combines a conversational coding workflow and authenticated live preview with teams, RBAC, generic OIDC single sign-on, editable OpenAI-compatible providers, scoped prompt policies, managed project resources, usage accounting, and deployment approvals.
 
 This repository is a self-hosted community edition, not a claim of feature-for-feature or security equivalence with Lovable. It is useful today for trusted company teams building web workspaces through an OpenAI-compatible endpoint. Read [Production readiness](docs/production-readiness.md) before allowing untrusted users or enabling command execution.
 
@@ -31,7 +31,7 @@ Screenshots use local demo records and contain no production credentials.
 
 ## What works
 
-- First-run organization and owner bootstrap, password login, opaque server-side sessions.
+- First-run organization and owner bootstrap, local password login, generic OIDC authorization-code SSO with PKCE, and opaque server-side sessions.
 - Organization and team membership with owner, admin, developer, reviewer, and viewer roles.
 - PostgreSQL-backed projects, runs, policies, hooks, usage, deployments, and audit events.
 - OpenRouter or any compatible `/chat/completions` endpoint with encrypted API keys.
@@ -91,6 +91,8 @@ The web UI runs at `http://127.0.0.1:5173`; the API runs at `http://127.0.0.1:87
 | `MASTER_KEY` | development-only value | Encrypts provider API keys; mandatory to change in production |
 | `PUBLIC_URL` | `http://127.0.0.1:8787` | Allowed browser origin and canonical URL |
 | `COOKIE_SECURE` | production-dependent | Requires HTTPS for session cookies |
+| `LOCAL_LOGIN_ENABLED` | `true` | Keeps local account login available for recovery |
+| `OIDC_ENABLED` | `false` | Enables generic OIDC single sign-on; see [OIDC setup](docs/oidc.md) |
 | `REQUIRE_SEPARATE_APPROVER` | `true` | Prevents users approving their own governed runs or deployments |
 | `TRUST_PROXY` | `false` | Trust reverse-proxy forwarding headers |
 | `EXECUTION_MODE` | `disabled` | `disabled`, `local`, or `docker` workspace verification |

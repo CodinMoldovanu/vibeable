@@ -10,6 +10,10 @@ Audit date: 2026-07-21. Scope: commit `745088d` and the remediations applied imm
 - Container inputs: Trivy scans of the exact Node and PostgreSQL image tags used by Compose and the Dockerfile.
 - Manual review: authentication, CSRF, RBAC, organization/team query boundaries, provider SSRF, encrypted resources, AI response parsing, generated file containment, Git subprocesses, preview isolation, build execution, and deployment adapters.
 
+## OIDC follow-up
+
+The generic OIDC addition was reviewed separately on 2026-07-21. It includes authorization code with PKCE, one-time hashed state, encrypted verifier storage, issuer/audience/nonce/signature validation, asymmetric algorithm allowlisting, verified-email policy, non-owner claim mapping, source-aware team synchronization, response limits, DNS validation, connection pinning, and disabled redirects. Request access logs omit query strings so authorization codes and state values are not retained. `pnpm audit --prod --audit-level high` reported no known vulnerabilities after the change.
+
 ## Remediated findings
 
 - High: patched `shell-quote` denial of service from the development dependency graph and changed CI to audit all dependencies.

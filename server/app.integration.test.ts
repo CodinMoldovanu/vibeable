@@ -4,6 +4,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import EmbeddedPostgres from "embedded-postgres";
 import { Pool } from "pg";
+import { exportJWK, generateKeyPair, SignJWT } from "jose";
 import { afterAll, beforeAll, describe, expect, it, vi } from "vitest";
 import { migrate } from "./migrate.js";
 import type { FastifyInstance } from "fastify";
@@ -53,6 +54,15 @@ describe("PostgreSQL API integration", () => {
     process.env.MASTER_KEY = "integration-test-master-key-with-adequate-entropy";
     process.env.PUBLIC_URL = "http://127.0.0.1:8787";
     process.env.REQUIRE_SEPARATE_APPROVER = "true";
+    process.env.OIDC_ENABLED = "true";
+    process.env.OIDC_ISSUER = "https://idp.example.test";
+    process.env.OIDC_CLIENT_ID = "vibeable-test";
+    process.env.OIDC_CLIENT_SECRET = "oidc-integration-secret";
+    process.env.OIDC_AUTO_PROVISION = "true";
+    process.env.OIDC_ALLOW_EMAIL_LINKING = "false";
+    process.env.OIDC_ORGANIZATION_SLUG = "vibeable-test";
+    process.env.OIDC_ROLE_MAPPING = JSON.stringify({ engineers: "developer" });
+    process.env.OIDC_TEAM_MAPPING = JSON.stringify({ engineers: "default" });
     const module = await import("./app.js");
     app = module.buildApp();
     await app.ready();
@@ -117,6 +127,73 @@ describe("PostgreSQL API integration", () => {
     })).statusCode).toBe(201);
     const expandedProjects = await authenticated("GET", "/api/projects", developerCookie);
     expect(expandedProjects.json().projects.map((project: { id: string }) => project.id).sort()).toEqual([defaultProjectId, secondProjectId].sort());
+  });
+
+  it("completes OIDC PKCE login, provisions RBAC, and rejects state replay", async () => {
+    const discoveryDocument = {
+      issuer: "https://idp.example.test",
+      authorization_endpoint: "https://idp.example.test/authorize",
+      token_endpoint: "https://idp.example.test/token",
+      jwks_uri: "https://idp.example.test/jwks",
+      response_types_supported: ["code"],
+      code_challenge_methods_supported: ["S256"]
+    };
+    vi.stubGlobal("fetch", vi.fn(async (input: string | URL | Request) => String(input).endsWith("/.well-known/openid-configuration")
+      ? new Response(JSON.stringify(discoveryDocument), { status: 200, headers: { "content-type": "application/json" } })
+      : new Response("not found", { status: 404 })));
+    const start = await app.inject({ method: "GET", url: "/api/auth/oidc/start?returnTo=%2F" });
+    expect(start.statusCode, start.body).toBe(302);
+    const authorization = new URL(start.headers.location!);
+    expect(authorization.origin).toBe("https://idp.example.test");
+    expect(authorization.searchParams.get("response_type")).toBe("code");
+    expect(authorization.searchParams.get("code_challenge_method")).toBe("S256");
+    expect(authorization.searchParams.get("code_challenge")).toMatch(/^[A-Za-z0-9_-]{43}$/);
+    const state = authorization.searchParams.get("state")!;
+    const nonce = authorization.searchParams.get("nonce")!;
+
+    const { publicKey, privateKey } = await generateKeyPair("RS256");
+    const jwk = await exportJWK(publicKey);
+    const idToken = await new SignJWT({
+      email: "oidc-developer@example.test",
+      email_verified: true,
+      name: "OIDC Developer",
+      groups: ["engineers"],
+      nonce
+    })
+      .setProtectedHeader({ alg: "RS256", kid: "integration-key" })
+      .setIssuer("https://idp.example.test")
+      .setAudience("vibeable-test")
+      .setSubject("oidc-user-1")
+      .setIssuedAt()
+      .setExpirationTime("5m")
+      .sign(privateKey);
+
+    vi.stubGlobal("fetch", vi.fn(async (input: string | URL | Request) => {
+      const url = String(input);
+      if (url.endsWith("/.well-known/openid-configuration")) return new Response(JSON.stringify(discoveryDocument), { status: 200, headers: { "content-type": "application/json" } });
+      if (url.endsWith("/token")) return new Response(JSON.stringify({ id_token: idToken, access_token: "access-token", token_type: "Bearer" }), { status: 200 });
+      if (url.endsWith("/jwks")) return new Response(JSON.stringify({ keys: [{ ...jwk, kid: "integration-key", use: "sig", alg: "RS256" }] }), { status: 200 });
+      return new Response("not found", { status: 404 });
+    }));
+
+    const callback = await app.inject({ method: "GET", url: `/api/auth/oidc/callback?code=test-code&state=${encodeURIComponent(state)}` });
+    expect(callback.statusCode).toBe(302);
+    expect(callback.headers.location).toBe("http://127.0.0.1:8787/");
+    const oidcCookie = sessionCookie(callback.headers["set-cookie"]);
+    const session = await authenticated("GET", "/api/session", oidcCookie);
+    expect(session.json().user).toEqual(expect.objectContaining({ email: "oidc-developer@example.test", role: "developer" }));
+    expect(session.json().teams).toContainEqual(expect.objectContaining({ id: defaultTeamId, role: "developer" }));
+
+    const replay = await app.inject({ method: "GET", url: `/api/auth/oidc/callback?code=test-code&state=${encodeURIComponent(state)}` });
+    expect(replay.statusCode).toBe(302);
+    expect(replay.headers.location).toContain("auth_error=oidc_failed");
+    expect(replay.headers["set-cookie"]).toBeUndefined();
+    vi.unstubAllGlobals();
+  });
+
+  it("rejects external OIDC return URLs", async () => {
+    const response = await app.inject({ method: "GET", url: "/api/auth/oidc/start?returnTo=https%3A%2F%2Fevil.example" });
+    expect(response.statusCode).toBe(400);
   });
 
   it("enforces metric scope membership", async () => {

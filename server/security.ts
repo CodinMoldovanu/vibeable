@@ -27,6 +27,10 @@ export function hashToken(token: string) {
   return createHash("sha256").update(token).digest("hex");
 }
 
+export function stripQueryForLog(value?: string) {
+  return value?.split("?", 1)[0];
+}
+
 export function encryptSecret(value: string) {
   const iv = randomBytes(12);
   const cipher = createCipheriv("aes-256-gcm", encryptionKey, iv);
@@ -47,33 +51,62 @@ export function decryptSecret(value: string) {
 }
 
 export function assertSafeProviderUrl(value: string) {
+  return assertSafeExternalUrl(value, {
+    allowPrivate: config.allowPrivateAiEndpoints,
+    allowHttp: config.allowPrivateAiEndpoints,
+    allowQuery: false,
+    label: "AI provider"
+  });
+}
+
+export function assertSafeExternalUrl(value: string, options: {
+  allowPrivate: boolean;
+  allowHttp: boolean;
+  allowQuery?: boolean;
+  label?: string;
+}) {
+  const label = options.label ?? "External";
   const url = new URL(value);
-  if (url.username || url.password || url.search || url.hash) {
-    throw new Error("AI provider URLs cannot contain credentials, query parameters, or fragments");
+  if (url.username || url.password || (!options.allowQuery && url.search) || url.hash) {
+    throw new Error(`${label} URLs cannot contain credentials${options.allowQuery ? " or fragments" : ", query parameters, or fragments"}`);
   }
-  if (url.protocol !== "https:" && !(config.allowPrivateAiEndpoints && url.protocol === "http:")) {
-    throw new Error("AI provider URLs must use HTTPS");
+  if (url.protocol !== "https:" && !(options.allowHttp && url.protocol === "http:")) {
+    throw new Error(`${label} URLs must use HTTPS`);
   }
 
-  if (isPrivateHost(url.hostname) && !config.allowPrivateAiEndpoints) {
-    throw new Error("Private AI endpoints require ALLOW_PRIVATE_AI_ENDPOINTS=true");
+  if (isPrivateHost(url.hostname) && !options.allowPrivate) {
+    throw new Error(`${label} URL uses a private or reserved address`);
   }
 
   return url.toString().replace(/\/$/, "");
 }
 
 export async function assertSafeProviderResolution(value: string) {
-  const normalized = assertSafeProviderUrl(value);
+  return assertSafeExternalResolution(value, {
+    allowPrivate: config.allowPrivateAiEndpoints,
+    allowHttp: config.allowPrivateAiEndpoints,
+    allowQuery: false,
+    label: "AI provider"
+  });
+}
+
+export async function assertSafeExternalResolution(value: string, options: {
+  allowPrivate: boolean;
+  allowHttp: boolean;
+  allowQuery?: boolean;
+  label?: string;
+}) {
+  const normalized = assertSafeExternalUrl(value, options);
   const url = new URL(normalized);
   let timer: NodeJS.Timeout | undefined;
   const addresses = await Promise.race([
     lookup(url.hostname, { all: true, verbatim: true }),
     new Promise<never>((_resolve, reject) => {
-      timer = setTimeout(() => reject(new Error("AI provider DNS lookup timed out")), 5_000);
+      timer = setTimeout(() => reject(new Error(`${options.label ?? "External"} DNS lookup timed out`)), 5_000);
     })
   ]).finally(() => clearTimeout(timer));
-  if (!addresses.length || (!config.allowPrivateAiEndpoints && addresses.some((address) => isPrivateHost(address.address)))) {
-    throw new Error("AI provider hostname resolves to a private or reserved address");
+  if (!addresses.length || (!options.allowPrivate && addresses.some((address) => isPrivateHost(address.address)))) {
+    throw new Error(`${options.label ?? "External"} hostname resolves to a private or reserved address`);
   }
   const selected = [...addresses].sort((left, right) => left.family - right.family)[0]!;
   return { url: normalized, address: selected.address, family: selected.family };

@@ -12,12 +12,12 @@ interface SessionRow extends Principal {
 }
 
 export async function authenticate(email: string, password: string) {
-  const result = await query<{ id: string; password_hash: string }>(
+  const result = await query<{ id: string; password_hash: string | null }>(
     "SELECT id, password_hash FROM users WHERE lower(email) = lower($1) AND disabled_at IS NULL",
     [email]
   );
   const user = result.rows[0];
-  return user && (await compare(password, user.password_hash)) ? user.id : null;
+  return user?.password_hash && (await compare(password, user.password_hash)) ? user.id : null;
 }
 
 export async function createSession(userId: string, reply: FastifyReply) {

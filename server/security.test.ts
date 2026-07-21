@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { assertSafeProviderUrl, decryptSecret, encryptSecret, hashToken } from "./security.js";
+import { assertSafeProviderUrl, decryptSecret, encryptSecret, hashToken, stripQueryForLog } from "./security.js";
 
 describe("security helpers", () => {
   it("encrypts provider secrets with authenticated encryption", () => {
@@ -11,6 +11,10 @@ describe("security helpers", () => {
   it("hashes session tokens before persistence", () => {
     expect(hashToken("session-token")).toMatch(/^[a-f0-9]{64}$/);
     expect(hashToken("session-token")).not.toBe("session-token");
+  });
+
+  it("removes sensitive query strings from request log URLs", () => {
+    expect(stripQueryForLog("/api/auth/oidc/callback?code=secret&state=secret")).toBe("/api/auth/oidc/callback");
   });
 
   it("rejects insecure and private provider endpoints by default", () => {

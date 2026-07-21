@@ -930,12 +930,12 @@ Recommended defaults:
 - Secrets are injected into runtime/deploy jobs, not exposed to models.
 - Every model request emits token usage metrics.
 - Every major action emits audit events.
+- Authentication uses provider-agnostic OIDC first, with local owner login retained for recovery.
 
 ## 25. Open Questions
 
 - Should projects be stored in an internal Git service, an embedded Git server, or user-provided repositories?
 - Should the first deployment target be Docker Compose, Kubernetes, or an existing internal platform?
-- Which auth provider should be used first: Keycloak, Authentik, Zitadel, WorkOS, or custom OIDC?
 - Should user-level AI overrides be enabled by default or only per team?
 - Should arbitrary custom AI endpoints be allowed only globally, or also at team scope?
 - Should local models be treated as zero-cost in reporting, or assigned internal compute cost estimates?

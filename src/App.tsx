@@ -15,6 +15,7 @@ interface Session {
   user: { userId: string; organizationId: string; name: string; email: string; role: Role; organizationName: string };
   teams: Array<{ id: string; name: string; role: Role }>;
 }
+interface AuthOptions { localLoginEnabled: boolean; oidc: { enabled: boolean; displayName: string } }
 interface Project {
   id: string; name: string; slug: string; status: string; environment: string;
   teamId: string; teamName: string; updatedAt: string; previewUrl: string; activeBranch: string;
@@ -54,6 +55,7 @@ const phases: AgentPhase[] = [
 export function App() {
   const [session, setSession] = useState<Session | null>(null);
   const [needsBootstrap, setNeedsBootstrap] = useState(false);
+  const [authOptions, setAuthOptions] = useState<AuthOptions>({ localLoginEnabled: true, oidc: { enabled: false, displayName: "Company SSO" } });
   const [loading, setLoading] = useState(true);
   const [startupError, setStartupError] = useState("");
 
@@ -65,8 +67,9 @@ export function App() {
       setSession(value);
     } catch (error) {
       if (error instanceof ApiError && error.status === 401) {
-        const setup = await api<{ needsBootstrap: boolean }>("/api/auth/setup-status");
+        const setup = await api<{ needsBootstrap: boolean } & AuthOptions>("/api/auth/setup-status");
         setNeedsBootstrap(setup.needsBootstrap);
+        setAuthOptions({ localLoginEnabled: setup.localLoginEnabled, oidc: setup.oidc });
         setSession(null);
       } else {
         setStartupError(error instanceof Error ? error.message : "The Vibeable API is unavailable");
@@ -79,13 +82,15 @@ export function App() {
   useEffect(() => { void loadSession(); }, [loadSession]);
   if (loading) return <div className="centerState"><Zap size={24} /><span>Loading Vibeable</span></div>;
   if (startupError) return <ServiceUnavailable message={startupError} retry={loadSession} />;
-  if (!session) return <AuthScreen bootstrap={needsBootstrap} onAuthenticated={loadSession} />;
+  if (!session) return <AuthScreen bootstrap={needsBootstrap} options={authOptions} onAuthenticated={loadSession} />;
   return <Builder session={session} onLogout={async () => { await api("/api/auth/logout", { method: "POST" }); await loadSession(); }} />;
 }
 
-function AuthScreen({ bootstrap, onAuthenticated }: { bootstrap: boolean; onAuthenticated: () => Promise<void> }) {
-  const [error, setError] = useState("");
+function AuthScreen({ bootstrap, options, onAuthenticated }: { bootstrap: boolean; options: AuthOptions; onAuthenticated: () => Promise<void> }) {
+  const initialError = new URLSearchParams(window.location.search).get("auth_error");
+  const [error, setError] = useState(initialError === "provisioning_denied" ? "Your identity is valid, but access has not been provisioned." : initialError ? "Single sign-on failed. Try again or contact an administrator." : "");
   const [busy, setBusy] = useState(false);
+  useEffect(() => { if (initialError) window.history.replaceState({}, "", window.location.pathname); }, [initialError]);
   async function submit(event: FormEvent<HTMLFormElement>) {
     event.preventDefault(); setBusy(true); setError("");
     const data = Object.fromEntries(new FormData(event.currentTarget));
@@ -99,14 +104,17 @@ function AuthScreen({ bootstrap, onAuthenticated }: { bootstrap: boolean; onAuth
     <section className="authPanel">
       <div className="authBrand"><span className="brandMark"><Zap size={20} /></span><div><strong>Vibeable</strong><small>Self-hosted app builder</small></div></div>
       <h1>{bootstrap ? "Create your workspace" : "Sign in"}</h1>
-      <form onSubmit={submit}>
+      {!bootstrap && options.oidc.enabled && <a className="oidcButton" href="/api/auth/oidc/start"><KeyRound size={17} />Continue with {options.oidc.displayName}</a>}
+      {!bootstrap && options.oidc.enabled && options.localLoginEnabled && <div className="authDivider"><span>or use a local account</span></div>}
+      {(bootstrap || options.localLoginEnabled) && <form onSubmit={submit}>
         {bootstrap && <><label>Organization<input name="organizationName" required minLength={2} /></label><label>Your name<input name="name" autoComplete="name" required /></label></>}
         <label>Email<input name="email" type="email" autoComplete="email" required /></label>
         <label>Password<input name="password" type="password" minLength={bootstrap ? 12 : 1} autoComplete={bootstrap ? "new-password" : "current-password"} required /></label>
         {bootstrap && <div className="providerSetup"><label>AI endpoint<input name="providerUrl" type="url" defaultValue="https://openrouter.ai/api/v1" required /></label><label>Model<input name="providerModel" defaultValue="openai/gpt-5-mini" required /></label><label>API key<input name="apiKey" type="password" autoComplete="off" /></label></div>}
         {error && <p className="formError" role="alert">{error}</p>}
         <button className="primaryButton" disabled={busy}>{busy ? "Working..." : bootstrap ? "Create workspace" : "Sign in"}</button>
-      </form>
+      </form>}
+      {!bootstrap && !options.localLoginEnabled && !options.oidc.enabled && <p className="formError" role="alert">No authentication method is currently available.</p>}
     </section>
   </main>;
 }

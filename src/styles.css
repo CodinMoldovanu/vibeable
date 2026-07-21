@@ -1480,6 +1480,42 @@ textarea:focus-visible {
   gap: 14px;
 }
 
+.oidcButton {
+  display: inline-flex;
+  width: 100%;
+  min-height: 42px;
+  align-items: center;
+  justify-content: center;
+  gap: 8px;
+  color: #ffffff;
+  background: #1f6f68;
+  border-radius: 8px;
+  font-weight: 760;
+  text-decoration: none;
+}
+
+.oidcButton:hover {
+  background: #195f59;
+}
+
+.authDivider {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  margin: 18px 0;
+  color: #7a868c;
+  font-size: 11px;
+  text-transform: uppercase;
+}
+
+.authDivider::before,
+.authDivider::after {
+  height: 1px;
+  flex: 1;
+  content: "";
+  background: #e0e7eb;
+}
+
 .authPanel label {
   display: grid;
   gap: 6px;

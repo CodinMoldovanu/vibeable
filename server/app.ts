@@ -16,10 +16,11 @@ import { registerDeliveryRoutes } from "./delivery-routes.js";
 import { pool, query, transaction } from "./db.js";
 import { subscribeToRun } from "./events.js";
 import { enqueueRun, recordRunEvent } from "./orchestrator.js";
+import { oidcPublicConfig, registerOidcRoutes } from "./oidc.js";
 import { requirePermission } from "./permissions.js";
 import { resolvePolicy } from "./policy.js";
 import { assertGitBranch } from "./project-git.js";
-import { assertSafeProviderUrl, encryptSecret } from "./security.js";
+import { assertSafeProviderUrl, encryptSecret, stripQueryForLog } from "./security.js";
 import {
   deleteProjectResource, listProjectResources, projectPreviewOrigins, provisionProjectDatabase, recordProjectLog,
   upsertProjectResource, type ResourceKind
@@ -44,7 +45,21 @@ const resourceConfigSchema = z.record(
 
 export function buildApp() {
   const app = Fastify({
-    logger: { level: config.LOG_LEVEL, redact: ["req.headers.authorization", "req.headers.cookie", "body.password", "body.apiKey"] },
+    logger: {
+      level: config.LOG_LEVEL,
+      redact: ["req.headers.authorization", "req.headers.cookie", "body.password", "body.apiKey"],
+      serializers: {
+        req(request) {
+          return {
+            method: request.method,
+            url: stripQueryForLog(request.url),
+            host: request.headers.host,
+            remoteAddress: request.socket.remoteAddress,
+            remotePort: request.socket.remotePort
+          };
+        }
+      }
+    },
     trustProxy: config.trustProxy,
     bodyLimit: 1_100_000,
     requestTimeout: 30_000
@@ -68,6 +83,7 @@ export function buildApp() {
     }
   });
   void app.register(fastifyRateLimit, { max: 300, timeWindow: "1 minute" });
+  registerOidcRoutes(app);
 
   app.addHook("onRequest", async (request, reply) => {
     if (request.url.startsWith("/api/") && !["GET", "HEAD", "OPTIONS"].includes(request.method)) {
@@ -90,7 +106,9 @@ export function buildApp() {
 
   app.get("/api/auth/setup-status", async () => {
     const result = await query<{ count: string }>("SELECT count(*)::text AS count FROM users");
-    return { needsBootstrap: Number(result.rows[0]?.count ?? 0) === 0 };
+    const needsBootstrap = Number(result.rows[0]?.count ?? 0) === 0;
+    const oidc = oidcPublicConfig();
+    return { needsBootstrap, localLoginEnabled: config.localLoginEnabled, oidc: { ...oidc, enabled: oidc.enabled && !needsBootstrap } };
   });
 
   app.post("/api/auth/bootstrap", { config: { rateLimit: { max: 5, timeWindow: "1 hour" } } }, async (request, reply) => {
@@ -155,6 +173,7 @@ export function buildApp() {
   });
 
   app.post("/api/auth/login", { config: { rateLimit: { max: 10, timeWindow: "15 minutes" } } }, async (request, reply) => {
+    if (!config.localLoginEnabled) return reply.code(404).send({ error: "Local login is disabled" });
     const input = z.object({ email: z.string().email(), password: z.string().min(1).max(200) }).parse(request.body);
     const userId = await authenticate(input.email, input.password);
     if (!userId) return reply.code(401).send({ error: "Invalid email or password" });

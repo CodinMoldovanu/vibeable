@@ -20,7 +20,7 @@ Vibeable 0.1 is a community preview for trusted internal teams. It is not yet sa
 - Run every generated build and preview in a dedicated container/microVM worker without Docker socket access.
 - Serve previews from a separate origin with short-lived capability tokens.
 - Add an outbound egress proxy or network policy for provider requests. DNS/IP validation and connection pinning are implemented in-process.
-- Add OIDC/SAML, MFA delegation, password reset, email invitations, and session management UI.
+- Add SAML, password reset, email invitations, and session management UI. OIDC authorization-code login delegates MFA to the configured identity provider.
 - Add side-by-side diffs, conflict-resolution UI, explicit accept/reject review, Git host application credentials, and protected-branch status integration. HTTPS remote pull/push and encrypted bearer/basic credentials are implemented.
 - Add a dedicated generated-application runtime worker before claiming backend, SMTP, API, or managed-database resources are available to deployed applications. Current values are build-verifier inputs and static previews receive no secrets.
 - Extract deployment execution into dedicated durable workers. Local adapters currently execute allowlisted binaries from the control-plane host; default container images intentionally do not include cluster credentials, a Docker socket, or deployment CLIs.
