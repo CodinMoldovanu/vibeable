@@ -8,7 +8,7 @@ This repository is a self-hosted community edition, not a claim of feature-for-f
 
 ### Builder and live preview
 
-![Vibeable builder with an agent timeline, generated inventory application preview, branch selection, and changed files](docs/screenshots/builder.jpg)
+![Vibeable builder with a completed agent timeline and a live generated technology digest application](docs/screenshots/builder.jpg)
 
 ### Technology and delivery governance
 
@@ -16,7 +16,7 @@ This repository is a self-hosted community edition, not a claim of feature-for-f
 
 ### Scoped token usage
 
-![Vibeable global token and cost usage dashboard](docs/screenshots/usage.jpg)
+![Vibeable project-scoped token usage for a real OpenRouter build](docs/screenshots/usage.jpg)
 
 ### Teams and AI governance
 
@@ -35,7 +35,7 @@ Screenshots use local demo records and contain no production credentials.
 - Organization and team membership with owner, admin, developer, reviewer, and viewer roles.
 - PostgreSQL-backed projects, runs, policies, hooks, usage, deployments, and audit events.
 - OpenRouter or any compatible `/chat/completions` endpoint with encrypted API keys.
-- Per-run provider and model dropdowns constrained by the effective policy; administrators can edit endpoints, models, prices, keys, and availability.
+- Per-run provider and model dropdowns constrained by the effective policy, with the provider default identified as the recommended model; administrators can edit endpoints, models, prices, keys, and availability.
 - Global, team, user, and project policy inheritance with hard provider/model intersections.
 - Automatic lifecycle intent selection plus scoped prompt hooks and approval flags.
 - Structured AI file edits with path traversal and binary/context limits.

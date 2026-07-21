@@ -795,6 +795,8 @@ function mimeType(path: string) {
 export function injectPreviewBridge(html: string, projectId: string) {
   const bridge = `<script data-vibeable-preview-bridge>(()=>{
 const projectId=${JSON.stringify(projectId)};
+const createStorage=()=>{const data=new Map();return{get length(){return data.size},clear:()=>data.clear(),getItem:(key)=>data.has(String(key))?data.get(String(key)):null,key:(index)=>[...data.keys()][index]??null,removeItem:(key)=>data.delete(String(key)),setItem:(key,value)=>data.set(String(key),String(value))}};
+for(const name of ['localStorage','sessionStorage']){try{void window[name]}catch{Object.defineProperty(window,name,{configurable:true,value:createStorage()})}}
 const serialize=(value)=>{try{return typeof value==='string'?value:JSON.stringify(value)}catch{return String(value)}};
 const send=(level,values)=>parent.postMessage({source:'vibeable-preview',projectId,level,message:values.map(serialize).join(' ').slice(0,4000)},'*');
 for(const level of ['debug','info','warn','error']){const original=console[level]?.bind(console);console[level]=(...values)=>{original?.(...values);send(level,values)}}
@@ -802,7 +804,9 @@ addEventListener('error',(event)=>send('error',[event.message,event.filename+':'
 addEventListener('unhandledrejection',(event)=>send('error',['Unhandled rejection',event.reason]));
 send('info',['Preview loaded']);
 })()</script>`;
-  return /<\/body\s*>/i.test(html) ? html.replace(/<\/body\s*>/i, `${bridge}</body>`) : `${html}${bridge}`;
+  if (/<head\b[^>]*>/i.test(html)) return html.replace(/<head\b[^>]*>/i, (head) => `${head}${bridge}`);
+  if (/<body\b[^>]*>/i.test(html)) return html.replace(/<body\b[^>]*>/i, (body) => `${body}${bridge}`);
+  return `${bridge}${html}`;
 }
 
 export async function closeApp() {

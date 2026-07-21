@@ -249,6 +249,8 @@ describe("PostgreSQL API integration", () => {
     expect(preview.headers["content-security-policy"]).toContain("sandbox allow-scripts allow-forms allow-modals");
     expect(preview.body).toContain("Integrated");
     expect(preview.body).toContain("vibeable-preview");
+    expect(preview.body).toContain("createStorage");
+    expect(preview.body.indexOf("vibeable-preview-bridge")).toBeLessThan(preview.body.indexOf("Integrated"));
     const projectUsage = (await authenticated("GET", `/api/metrics/usage?scope=project&id=${defaultProjectId}`, developerCookie)).json().usage;
     expect(projectUsage).toEqual([expect.objectContaining({ model: "test/model", totalTokens: 20, requests: 1 })]);
 

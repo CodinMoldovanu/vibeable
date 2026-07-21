@@ -642,6 +642,24 @@ textarea:focus-visible {
   text-transform: uppercase;
 }
 
+.contextLabel {
+  align-items: center;
+  display: flex;
+  gap: 6px;
+}
+
+.contextLabel small {
+  background: #e8f6ee;
+  border: 1px solid #bce3ca;
+  border-radius: 4px;
+  color: #18733b;
+  font-size: 9px;
+  font-weight: 700;
+  line-height: 16px;
+  padding: 0 5px;
+  text-transform: none;
+}
+
 .composerHeading small {
   min-width: 0;
   overflow: hidden;
