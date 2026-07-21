@@ -1,6 +1,9 @@
 packages:
   - .
 
+overrides:
+  shell-quote: 1.10.0
+
 allowBuilds:
   '@embedded-postgres/darwin-arm64': true
   '@embedded-postgres/darwin-x64': true

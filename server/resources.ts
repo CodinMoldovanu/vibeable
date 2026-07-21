@@ -94,11 +94,21 @@ export async function provisionProjectDatabase(input: {
         WHERE organization_id=$1 AND project_id=$2 AND kind='database' AND name='DATABASE_URL' AND environment='development'`,
       [input.organizationId, input.projectId]
     );
-    if (existing.rows[0]) return existing.rows[0].id;
+    const hardenRole = async () => {
+      await database.query(`ALTER ROLE ${quoteIdentifier(role)} NOSUPERUSER NOCREATEDB NOCREATEROLE NOINHERIT NOREPLICATION NOBYPASSRLS CONNECTION LIMIT 20`);
+      await database.query(`ALTER ROLE ${quoteIdentifier(role)} IN DATABASE ${quoteIdentifier(databaseName)} SET search_path TO ${quoteIdentifier(schema)}`);
+      await database.query(`ALTER ROLE ${quoteIdentifier(role)} IN DATABASE ${quoteIdentifier(databaseName)} SET statement_timeout TO '30s'`);
+      await database.query(`ALTER ROLE ${quoteIdentifier(role)} IN DATABASE ${quoteIdentifier(databaseName)} SET idle_in_transaction_session_timeout TO '30s'`);
+      await database.query(`ALTER ROLE ${quoteIdentifier(role)} IN DATABASE ${quoteIdentifier(databaseName)} SET lock_timeout TO '10s'`);
+    };
+    if (existing.rows[0]) {
+      await hardenRole();
+      return existing.rows[0].id;
+    }
     await database.query(`DO $$ BEGIN CREATE ROLE ${quoteIdentifier(role)} LOGIN PASSWORD '${password}'; EXCEPTION WHEN duplicate_object THEN ALTER ROLE ${quoteIdentifier(role)} PASSWORD '${password}'; END $$`);
     await database.query(`CREATE SCHEMA IF NOT EXISTS ${quoteIdentifier(schema)} AUTHORIZATION ${quoteIdentifier(role)}`);
     await database.query(`GRANT CONNECT ON DATABASE ${quoteIdentifier(databaseName)} TO ${quoteIdentifier(role)}`);
-    await database.query(`ALTER ROLE ${quoteIdentifier(role)} IN DATABASE ${quoteIdentifier(databaseName)} SET search_path TO ${quoteIdentifier(schema)}`);
+    await hardenRole();
     const result = await database.query<{ id: string }>(
       `INSERT INTO project_resources
         (organization_id, project_id, kind, name, environment, config, encrypted_value, created_by)

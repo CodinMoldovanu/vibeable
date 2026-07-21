@@ -29,6 +29,8 @@ Vibeable 0.1 is a community preview for trusted internal teams. It is not yet sa
 - Add broader browser end-to-end coverage, backup/restore drills, SLOs, and load tests. Disposable PostgreSQL API integration tests run in the standard test suite.
 - Complete an independent security review.
 
+The in-repository audit in [Security audit](security-audit.md) records automated scanner coverage, remediations, and accepted residual risks. It is a point-in-time review, not an independent penetration test.
+
 ## Release checklist
 
 - `pnpm check` passes on the release commit.

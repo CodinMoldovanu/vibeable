@@ -72,6 +72,7 @@ describe("PostgreSQL API integration", () => {
     const response = await app.inject({
       method: "POST",
       url: "/api/auth/bootstrap",
+      headers: csrf,
       payload: {
         organizationName: "Vibeable Test",
         name: "Owner User",
@@ -84,7 +85,7 @@ describe("PostgreSQL API integration", () => {
     expect(response.statusCode).toBe(201);
     ownerCookie = sessionCookie(response.headers["set-cookie"]);
     expect(ownerCookie).toContain("vibeable_session=");
-    const duplicate = await app.inject({ method: "POST", url: "/api/auth/bootstrap", payload: {
+    const duplicate = await app.inject({ method: "POST", url: "/api/auth/bootstrap", headers: csrf, payload: {
       organizationName: "Other", name: "Other Owner", email: "other@example.test", password: "owner-password-456"
     } });
     expect(duplicate.statusCode).toBe(409);
@@ -168,6 +169,7 @@ describe("PostgreSQL API integration", () => {
     const preview = await authenticated("GET", `/api/projects/${defaultProjectId}/preview/index.html`, developerCookie);
     expect(preview.statusCode).toBe(200);
     expect(preview.headers["cache-control"]).toBe("private, no-store");
+    expect(preview.headers["content-security-policy"]).toContain("sandbox allow-scripts allow-forms allow-modals");
     expect(preview.body).toContain("Integrated");
     expect(preview.body).toContain("vibeable-preview");
     const projectUsage = (await authenticated("GET", `/api/metrics/usage?scope=project&id=${defaultProjectId}`, developerCookie)).json().usage;
@@ -224,6 +226,14 @@ describe("PostgreSQL API integration", () => {
     expect(JSON.stringify(providers)).not.toContain("provider-secret-value");
   });
 
+  it("rejects cross-site and headerless authentication mutations", async () => {
+    expect((await app.inject({ method: "POST", url: "/api/auth/logout", headers: { cookie: ownerCookie } })).statusCode).toBe(403);
+    expect((await app.inject({
+      method: "POST", url: "/api/auth/login", headers: { ...csrf, origin: "https://attacker.example" },
+      payload: { email: "owner@example.test", password: "owner-password-123" }
+    })).statusCode).toBe(403);
+  });
+
   it("manages project capabilities and redacts secrets from runtime logs", async () => {
     const resource = await authenticated("POST", `/api/projects/${defaultProjectId}/resources`, ownerCookie, {
       kind: "api", name: "PAYMENTS_API_KEY", environment: "development", value: "top-secret-payment-token", config: { url: "https://payments.example.test/v1" }
@@ -249,6 +259,8 @@ describe("PostgreSQL API integration", () => {
     const withDatabase = (await authenticated("GET", `/api/projects/${defaultProjectId}/resources`, ownerCookie)).json().resources as Array<{ id: string; kind: string; config: { role?: string } }>;
     const databaseResource = withDatabase.find((item) => item.id === firstDatabase.json().id)!;
     expect(databaseResource.config.role).toMatch(/^vibeable_app_/);
+    const managedRole = await databasePool.query<{ rolconnlimit: number }>("SELECT rolconnlimit FROM pg_roles WHERE rolname=$1", [databaseResource.config.role]);
+    expect(managedRole.rows[0]?.rolconnlimit).toBe(20);
 
     const unsafeGit = await authenticated("POST", `/api/projects/${defaultProjectId}/resources`, ownerCookie, {
       kind: "git", name: "SOURCE_REPOSITORY", environment: "development", config: { repositoryUrl: "https://token@example.test/repo.git" }
@@ -302,7 +314,7 @@ async function authenticated(method: "GET" | "POST" | "PUT" | "PATCH" | "DELETE"
 }
 
 async function login(email: string, password: string) {
-  const response = await app.inject({ method: "POST", url: "/api/auth/login", payload: { email, password } });
+  const response = await app.inject({ method: "POST", url: "/api/auth/login", headers: csrf, payload: { email, password } });
   expect(response.statusCode).toBe(200);
   return sessionCookie(response.headers["set-cookie"]);
 }

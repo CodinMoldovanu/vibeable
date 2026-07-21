@@ -17,7 +17,12 @@ describe("security helpers", () => {
     expect(assertSafeProviderUrl("https://openrouter.ai/api/v1/")).toBe("https://openrouter.ai/api/v1");
     expect(() => assertSafeProviderUrl("http://127.0.0.1:8000/v1")).toThrow();
     expect(() => assertSafeProviderUrl("https://100.64.0.1/v1")).toThrow();
+    expect(() => assertSafeProviderUrl("https://192.0.2.1/v1")).toThrow();
+    expect(() => assertSafeProviderUrl("https://198.51.100.1/v1")).toThrow();
+    expect(() => assertSafeProviderUrl("https://203.0.113.1/v1")).toThrow();
+    expect(() => assertSafeProviderUrl("https://service.home.arpa/v1")).toThrow();
     expect(() => assertSafeProviderUrl("https://[fd00::1]/v1")).toThrow();
+    expect(() => assertSafeProviderUrl("https://[2001:db8::1]/v1")).toThrow();
     expect(() => assertSafeProviderUrl("https://[fec0::1]/v1")).toThrow();
     expect(() => assertSafeProviderUrl("https://[ff02::1]/v1")).toThrow();
     expect(() => assertSafeProviderUrl("https://[::ffff:127.0.0.1]/v1")).toThrow();

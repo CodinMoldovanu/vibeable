@@ -51,7 +51,7 @@ export function buildApp() {
   });
 
   void app.register(fastifyCookie);
-  void app.register(fastifyCors, { origin: config.PUBLIC_URL, credentials: true, methods: ["GET", "POST", "PATCH", "DELETE"] });
+  void app.register(fastifyCors, { origin: config.PUBLIC_URL, credentials: true, methods: ["GET", "POST", "PUT", "PATCH", "DELETE"] });
   void app.register(fastifyHelmet, {
     contentSecurityPolicy: {
       directives: {
@@ -70,9 +70,12 @@ export function buildApp() {
   void app.register(fastifyRateLimit, { max: 300, timeWindow: "1 minute" });
 
   app.addHook("onRequest", async (request, reply) => {
-    if (request.url.startsWith("/api/") && !["GET", "HEAD", "OPTIONS"].includes(request.method) &&
-        !request.url.startsWith("/api/auth/") && request.headers["x-vibeable-csrf"] !== "1") {
-      return reply.code(403).send({ error: "Missing CSRF header" });
+    if (request.url.startsWith("/api/") && !["GET", "HEAD", "OPTIONS"].includes(request.method)) {
+      if (request.headers["x-vibeable-csrf"] !== "1") return reply.code(403).send({ error: "Missing CSRF header" });
+      const origin = request.headers.origin;
+      if (origin && origin !== new URL(config.PUBLIC_URL).origin) {
+        return reply.code(403).send({ error: "Request origin is not allowed" });
+      }
     }
   });
 
@@ -383,7 +386,7 @@ export function buildApp() {
       : content;
     return reply.type(mimeType(path))
       .header("cache-control", "private, no-store")
-      .header("content-security-policy", `default-src 'self'; style-src 'self' 'unsafe-inline'; script-src 'self' 'unsafe-inline'; img-src 'self' data: ${previewOrigins.join(" ")}; connect-src 'self' ${previewOrigins.join(" ")}; object-src 'none'; base-uri 'none'; frame-ancestors 'self'`)
+      .header("content-security-policy", `sandbox allow-scripts allow-forms allow-modals; default-src 'self'; style-src 'self' 'unsafe-inline'; script-src 'self' 'unsafe-inline'; img-src 'self' data: ${previewOrigins.join(" ")}; connect-src 'self' ${previewOrigins.join(" ")}; object-src 'none'; base-uri 'none'; frame-ancestors 'self'`)
       .send(body);
   });
 
@@ -724,6 +727,7 @@ function registerProjectResourceRoutes(app: FastifyInstance) {
 
   app.post("/api/projects/:projectId/logs", async (request, reply) => {
     const principal = await requirePrincipal(request);
+    requirePermission(principal, "agent:run");
     const { projectId } = z.object({ projectId: idSchema }).parse(request.params);
     const project = await getAccessibleProject(principal, projectId); assertProjectOperational(project);
     const input = z.object({

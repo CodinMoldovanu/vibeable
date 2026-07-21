@@ -13,7 +13,7 @@
 | --- | --- | --- |
 | Cross-tenant data access | Organization/team constraints, composite database foreign keys, permission checks, and PostgreSQL route tests | Route-level tests must expand with every endpoint |
 | Session theft | Random opaque tokens, hash-only storage, HttpOnly/SameSite cookies, Secure in production | Operators must terminate TLS correctly |
-| CSRF | SameSite Strict cookie, exact CORS origin, custom mutation header | Reverse proxies must not rewrite origin policy |
+| CSRF | SameSite Strict cookie, exact CORS origin, required mutation header on every API mutation, and origin validation when supplied | Reverse proxies must not rewrite origin policy |
 | Provider-key disclosure | AES-256-GCM at rest, server-only decryption, exact credential reflection rejection, and log redaction | `MASTER_KEY` rotation is not automated yet |
 | Project-secret disclosure | Encrypted values, write-only APIs, metadata-only model context, exact-value and URL-credential log redaction | A production secret-manager integration and automated rotation are still required |
 | Provider SSRF | HTTPS-only and private-address blocking by default, DNS validation, address pinning, and redirects disabled | Production deployments still need an outbound egress proxy or network policy |
@@ -21,9 +21,9 @@
 | Malicious model output | JSON schema, real-path containment, symlink rejection, repository-metadata and secret-file denial, context exclusions, and size limits | Generated application code remains untrusted |
 | Host command execution | Disabled by default; Git hooks and global/system Git configuration disabled; Docker resource and privilege limits | Docker daemon access and dependency execution need a separate worker in shared production |
 | Deployment command injection | Strict adapter schemas, validated paths/branches, fixed binary and argument construction, no shell, selected resource injection, bounded redacted output, and execution disabled by default | Local adapters still hold the authority of their kubeconfig, Docker endpoint, or webhook token and belong in a dedicated worker |
-| Preview attacks | Authenticated route, secret and repository-metadata denial, no-store caching, sandboxed iframe, and restrictive CSP | Generated content should move to a separate origin before untrusted multi-user use |
+| Preview attacks | Authenticated route, secret and repository-metadata denial, no-store caching, iframe sandbox, and response-level CSP sandbox for direct navigation | Generated content should still move to a separate origin before hostile multi-user use |
 | Log prompt injection | Logs and workspace content are labeled as untrusted data in the system prompt; secret values are redacted before persistence | Model behavior is probabilistic; logs must never grant capabilities or bypass policy |
-| Managed database leftovers | Project-specific role/schema, transactional provisioning, idempotent creation, and role/schema removal on resource deletion | Operators still need database backup, monitoring, and connection limits |
+| Managed database leftovers | Project-specific constrained role/schema, connection and statement limits, transactional provisioning, idempotent creation, and role/schema removal on resource deletion | Operators still need database backup and monitoring; schemas are not a hostile-tenant boundary |
 | Budget abuse | Effective monthly cap checked before calls, persisted exact usage | Concurrent calls can race the cap without reservations |
 
 ## Non-negotiable deployment rules
