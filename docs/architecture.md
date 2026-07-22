@@ -2,6 +2,8 @@
 
 Vibeable is a single deployable control plane with a PostgreSQL database and project workspaces on durable storage.
 
+For the product workflow built on this architecture, read the [User guide](user-guide.md). For topology, backup, and execution-mode decisions, read the [Operator guide](operator-guide.md).
+
 ```mermaid
 flowchart LR
   Browser["React builder"] -->|session cookie| API["Fastify API"]
@@ -56,8 +58,12 @@ Prompt hooks matching the run phase are gathered from every applicable scope and
 
 The in-process orchestrator is suitable for one control-plane replica. Horizontal scaling requires a durable queue and dedicated workers before multiple replicas are started.
 
+The workspace Git repository is not the complete project record. PostgreSQL stores identity, memberships, policy, run metadata, encrypted resources, usage, Git settings, and deployments; `DATA_DIR` stores repository files and deployment worktrees. Operators must back up PostgreSQL and `DATA_DIR` together even when every project has a remote.
+
 ## Delivery lifecycle
 
 Deployment profiles are scoped to a team or project and use a strict adapter-specific schema. A deployment resolves a branch to an exact commit, validates referenced workspace paths and endpoints, and snapshots the profile name, adapter configuration, and selected resource names into an immutable plan. Production plans require an independent approver. Execution checks out the recorded commit into a detached worktree, injects only the snapshotted resources, runs a fixed adapter command without a shell, records bounded redacted output, and performs an optional pinned health check. Rollback creates a new governed deployment for the prior successful commit.
 
 Projects can be archived in place or mirrored to Git and offloaded from workspace storage. Trash is reversible; permanent purge is owner-only and removes managed resources, database records, and workspace data.
+
+Deployment execution is separate from preview and verification. A successful static preview does not imply that a generated backend is running, and project secret values are never sent to the preview. See [Deploy an exact commit](user-guide.md#deploy-an-exact-commit) for the operator and user responsibilities.

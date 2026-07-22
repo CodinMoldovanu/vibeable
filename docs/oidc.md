@@ -8,6 +8,8 @@ ${PUBLIC_URL}/api/auth/oidc/callback
 
 The provider must return a signed ID token containing `sub`, `email`, and normally `email_verified`. Vibeable validates issuer, audience, signature, expiry, nonce, one-time state, and an allowlist of signing algorithms. Discovery, token, JWKS, and UserInfo requests use bounded responses, timeouts, disabled redirects, DNS checks, and connection pinning.
 
+OIDC feeds the same persisted organization roles and team memberships described in the [User guide](user-guide.md#roles). It is authentication and provisioning, not a second authorization system.
+
 ## Minimum configuration
 
 ```dotenv
@@ -47,3 +49,5 @@ OIDC_CLIENT_SECRET=
 ```
 
 For nested group claims, set a dotted claim path such as `OIDC_GROUPS_CLAIM=realm_access.roles`.
+
+For reverse-proxy, backup, and recovery requirements around SSO, see the [Operator guide](operator-guide.md).

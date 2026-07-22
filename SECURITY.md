@@ -12,4 +12,4 @@ You should receive acknowledgement within three business days and an initial ass
 
 ## Scope notes
 
-Generated code and model output are untrusted input. `EXECUTION_MODE=local` is explicitly outside the supported shared-host security boundary. See [docs/threat-model.md](docs/threat-model.md) before deployment.
+Generated code and model output are untrusted input. `EXECUTION_MODE=local` is explicitly outside the supported shared-host security boundary. See [docs/threat-model.md](docs/threat-model.md) before deployment and [docs/operator-guide.md](docs/operator-guide.md) for the supported topology, backup unit, and execution modes.

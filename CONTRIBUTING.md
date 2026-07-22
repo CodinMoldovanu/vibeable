@@ -19,4 +19,6 @@ Changes to permissions, tenant queries, provider networking, secret handling, wo
 
 Keep pull requests narrowly scoped. Explain behavior changes, migration impact, security implications, and manual verification. Do not include generated workspaces, credentials, `.env` files, or customer data.
 
+User-visible changes must update the relevant public workflow in [README.md](README.md), the [User guide](docs/user-guide.md), or the [Operator guide](docs/operator-guide.md). Keep aspirational design in [SPEC.md](SPEC.md) clearly labeled as roadmap rather than shipped behavior.
+
 By participating, you agree to the [Code of Conduct](CODE_OF_CONDUCT.md). Security issues belong in the private process described by [SECURITY.md](SECURITY.md), not a public issue.

@@ -2,6 +2,8 @@
 
 Vibeable 0.1 is a community preview for trusted internal teams. It is not yet safe to market as a feature-complete or security-equivalent replacement for Lovable.
 
+Start with the [User guide](user-guide.md) to evaluate the implemented workflow and the [Operator guide](operator-guide.md) to deploy, back up, restore, and monitor it. This page defines the boundary those guides must not be read beyond.
+
 ## Ready for
 
 - A single organization on one control-plane replica.

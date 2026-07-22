@@ -38,3 +38,5 @@
 - Keep `MASTER_KEY` outside Compose files and source control.
 
 See [Production readiness](production-readiness.md) for the release gates that remain.
+
+Operational deployment, backup, restore, execution-mode, and egress guidance is in the [Operator guide](operator-guide.md). End-user handling of providers, resources, Git, and deployment approvals is in the [User guide](user-guide.md).

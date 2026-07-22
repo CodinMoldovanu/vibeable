@@ -1,5 +1,18 @@
 # Vibeable Product and Technical Specification
 
+> **Document status:** This specification captures the product direction, design vocabulary, and broader target architecture. It is not a release contract. Some sections describe roadmap behavior such as template catalogs, live framework dev servers, side-by-side diffs, durable queues, and isolated runtime workers that are not implemented in the current community preview. For shipped workflows use the [README](README.md), [User guide](docs/user-guide.md), [Operator guide](docs/operator-guide.md), [Architecture](docs/architecture.md), and [Production readiness](docs/production-readiness.md). When documents disagree, current implementation and production-readiness boundaries take precedence.
+
+Current release status at a glance:
+
+| Area | Status |
+| --- | --- |
+| Accounts, teams, RBAC, local login, and generic OIDC | Implemented for one organization and one control-plane replica |
+| OpenAI-compatible providers, scoped policy, hooks, budgets, and usage | Implemented with administrator-managed exact model IDs and pre-call budget checks |
+| Structured file generation, Git commits, progress, static preview, logs, and one repair pass | Implemented; side-by-side diff acceptance and framework dev-server hosting are roadmap |
+| Stack constraints, project resources, managed development schema, Git remotes/workers, and lifecycle controls | Implemented within the trusted-team boundaries documented in the user guide |
+| Exact-commit deployment profiles, approvals, adapters, health checks, and rollback records | Implemented; isolated durable execution workers remain roadmap |
+| Hostile multi-tenant isolation, horizontally scaled orchestration, and managed backend hosting | Not implemented |
+
 ## 1. Overview
 
 Vibeable is a self-hosted, company-controlled, Lovable-style application builder. Users create and modify applications through a chat-first interface while seeing a live visual preview, file changes, logs, tests, and deployment state in real time.
@@ -31,7 +44,7 @@ The platform is designed for internal company use with accounts, teams, RBAC, au
 - Unrestricted user-supplied AI endpoints.
 - Fully autonomous production deploys without policy controls.
 
-## 4. Primary User Experience
+## 4. Target User Experience
 
 The primary workspace has four main areas:
 
@@ -49,7 +62,7 @@ The primary workspace has four main areas:
 +--------------------------------------------------------------+
 ```
 
-Core workflow:
+Target workflow:
 
 1. User creates a project from an approved template.
 2. User enters a prompt such as "Build an internal CRM with auth, contacts, companies, and notes."
